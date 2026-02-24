@@ -39,3 +39,8 @@ torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux' or sys_pla
 torchvision = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 torchaudio = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
 batteryml = { git = "https://github.com/microsoft/BatteryML.git" }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+]
