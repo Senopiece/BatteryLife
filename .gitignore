@@ -6,4 +6,4 @@ __pycache__/
 wandb/
 outs/
 dev/
-.dataset/
+dataset/processed
