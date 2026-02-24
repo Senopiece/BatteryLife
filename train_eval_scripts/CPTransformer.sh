@@ -1,5 +1,5 @@
 model_name=CPTransformer
-dataset=MIX_large # MIX_large
+dataset=NAion
 train_epochs=100
 early_cycle_threshold=100
 learning_rate=0.00005
@@ -21,7 +21,7 @@ lradj=constant
 loss=MSE
 seed=2021
 
-checkpoints=/path/to/your/saving/folder # the save path of checkpoints
+checkpoints=/out/checkpoints/cpt # the save path of checkpoints
 data=Dataset_original
 root_path=./dataset
 comment='CPTransformer'
@@ -53,7 +53,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --multi_gpu  --num_processes $num_pro
   --accumulation_steps $accumulation_steps \
   --charge_discharge_length $charge_discharge_length \
   --dataset $dataset \
-  --num_workers 32 \
+  --num_workers 1 \
   --e_layers $e_layers \
   --lstm_layers $lstm_layers \
   --d_layers $d_layers \
