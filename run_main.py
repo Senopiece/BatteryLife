@@ -10,7 +10,7 @@ from utils.tools import get_parameter_number
 from models import CPGRU, CPLSTM, CPMLP, CPBiGRU, CPBiLSTM, CPTransformer, PatchTST, iTransformer, Transformer, \
     DLinear, Autoformer, MLP, MICN, CNN,  \
     BiLSTM, BiGRU, GRU, LSTM
-import mlop as wandb
+import trackio as wandb
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from data_provider.data_factory import data_provider_baseline
 import time

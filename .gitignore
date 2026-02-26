@@ -7,5 +7,6 @@ wandb/
 outs/
 dev/
 dataset/NA-ion
+dataset/Life\ labels
 dataset/processed
 .venv/

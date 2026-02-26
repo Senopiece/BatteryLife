@@ -27,7 +27,7 @@ root_path=./dataset
 comment='CPTransformer'
 task_name=classification
 
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch --multi_gpu  --num_processes $num_process --main_process_port $master_port run_main.py \
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes $num_process --main_process_port $master_port run_main.py \
   --task_name $task_name \
   --data $data \
   --is_training 1 \

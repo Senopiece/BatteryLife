@@ -10,7 +10,7 @@ from scipy.signal.windows import gaussian
 from sklearn.metrics import root_mean_squared_error, mean_absolute_percentage_error
 import time
 from torch import nn
-import mlop as wandb
+import trackio as wandb
 
 plt.switch_backend("agg")
 
