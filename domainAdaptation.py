@@ -28,7 +28,7 @@ from models import (
     GRU,
     LSTM,
 )
-import trackio as wandb
+from utils import trackio_logging
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from data_provider.data_factory import data_provider_baseline_DA
 import time
@@ -363,7 +363,7 @@ for ii in range(args.itr):
     with open(path + "/args.json", "w") as f:
         json.dump(args.__dict__, f)
     if accelerator.is_local_main_process:
-        wandb.init(
+        trackio_logging.init(
             # set the wandb project where this run will be logged
             project="new_LifeBaseline",
             # track hyperparameters and run metadata
@@ -645,7 +645,7 @@ for ii in range(args.itr):
         )
 
         if accelerator.is_local_main_process:
-            wandb.log(
+            trackio_logging.log(
                 {
                     "epoch": epoch,
                     "train_loss": train_loss,
@@ -702,7 +702,7 @@ accelerator.print(
 accelerator.print(path)
 accelerator.set_trigger()
 if accelerator.check_trigger() and accelerator.is_local_main_process:
-    wandb.log(
+    trackio_logging.log(
         {
             "epoch": epoch + 1,
             "train_loss": train_loss,
@@ -716,4 +716,4 @@ if accelerator.check_trigger() and accelerator.is_local_main_process:
             "test_acc2": best_test_alpha_acc2,
         }
     )
-    wandb.finish()
+    trackio_logging.finish()

@@ -10,7 +10,7 @@ from utils.tools import get_parameter_number
 from models import CPGRU, CPLSTM, CPMLP, CPBiGRU, CPBiLSTM, CPTransformer, PatchTST, iTransformer, Transformer, \
     DLinear, Autoformer, MLP, MICN, CNN,  \
     BiLSTM, BiGRU, GRU, LSTM
-import trackio as wandb
+from utils import trackio_logging
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from data_provider.data_factory import data_provider_baseline
 import time
@@ -221,7 +221,7 @@ for ii in range(args.itr):
     with open(path+'/args.json', 'w') as f:
         json.dump(args.__dict__, f)
     if accelerator.is_local_main_process:
-        wandb.init(
+        trackio_logging.init(
         # set the wandb project where this run will be logged
         project="new_LifeBaseline",
         
@@ -397,7 +397,7 @@ for ii in range(args.itr):
             f"Test RMSE: {test_rmse:.7f}| Test MAE: {test_mae_loss:.7f} | Test MAPE: {test_mape:.7f}")
         
         if accelerator.is_local_main_process:
-            wandb.log({"epoch": epoch, "train_loss": train_loss, "vali_RMSE": vali_rmse, "vali_MAPE": vali_mape, "vali_acc1": vali_alpha_acc1, "vali_acc2": vali_alpha_acc2, 
+            trackio_logging.log({"epoch": epoch, "train_loss": train_loss, "vali_RMSE": vali_rmse, "vali_MAPE": vali_mape, "vali_acc1": vali_alpha_acc1, "vali_acc2": vali_alpha_acc2, 
                        "test_RMSE": test_rmse, "test_MAPE": test_mape, "test_acc1": test_alpha_acc1, "test_acc2": test_alpha_acc2})
         
         early_stopping(epoch+1, vali_loss, vali_mae_loss, test_mae_loss, model, path)
@@ -425,6 +425,6 @@ accelerator.print(f'Best model performance: Test Seen 10%-accuracy: {best_seen_t
 accelerator.print(path)
 accelerator.set_trigger()
 if accelerator.check_trigger() and accelerator.is_local_main_process:
-    wandb.log({"epoch": epoch+1, "train_loss": train_loss, "vali_RMSE": best_vali_RMSE, "vali_MAPE": best_vali_MAPE, "vali_acc1": best_vali_alpha_acc1, "vali_acc2": best_vali_alpha_acc2, 
+    trackio_logging.log({"epoch": epoch+1, "train_loss": train_loss, "vali_RMSE": best_vali_RMSE, "vali_MAPE": best_vali_MAPE, "vali_acc1": best_vali_alpha_acc1, "vali_acc2": best_vali_alpha_acc2, 
                "test_RMSE": best_test_RMSE, "test_MAPE":best_test_MAPE, "test_acc1": best_test_alpha_acc1, "test_acc2": best_test_alpha_acc2})
-    wandb.finish()
+    trackio_logging.finish()
