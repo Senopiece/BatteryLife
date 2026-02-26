@@ -6,5 +6,6 @@ __pycache__/
 wandb/
 outs/
 dev/
+dataset/NA-ion
 dataset/processed
 .venv/
