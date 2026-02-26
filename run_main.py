@@ -106,10 +106,10 @@ parser.add_argument('--weighted_loss', action='store_true', default=False, help=
 parser.add_argument('--weighted_sampling', action='store_true', default=False, help='use weighted sampling')
 parser.add_argument('--num_workers', type=int, default=1, help='data loader num workers')
 parser.add_argument('--itr', type=int, default=1, help='experiments times')
-parser.add_argument('--train_epochs', type=int, default=10, help='train epochs')
+parser.add_argument('--train_epochs', type=int, default=100, help='train epochs')
 parser.add_argument('--least_epochs', type=int, default=5, help='The model is trained at least some epoches before the early stopping is used')
 parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
-parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
+parser.add_argument('--patience', type=int, default=1000, help='early stopping patience')
 parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
 parser.add_argument('--wd', type=float, default=0.0, help='weight decay')
 parser.add_argument('--des', type=str, default='test', help='exp description')
@@ -124,6 +124,7 @@ parser.add_argument('--mlp', type=int, default=0)
 # Evaluation alpha-accuracy
 parser.add_argument('--alpha1', type=float, default=0.15, help='the 10 percent alpha for alpha-accuracy')
 parser.add_argument('--alpha2', type=float, default=0.1, help='the 15 percent alpha for alpha-accuracy')
+parser.add_argument('--trackio_project', type=str, default='new_LifeBaseline', help='Trackio project name')
 
 
 
@@ -223,7 +224,7 @@ for ii in range(args.itr):
     if accelerator.is_local_main_process:
         trackio_logging.init(
         # set the wandb project where this run will be logged
-        project="new_LifeBaseline",
+        project=args.trackio_project,
         
         # track hyperparameters and run metadata
         config=args.__dict__,

@@ -43,3 +43,4 @@ def log(metrics: Mapping[str, Any], step: int | None = None) -> None:
 
 def finish() -> None:
     trackio.finish()
+

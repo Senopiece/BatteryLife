@@ -26,6 +26,7 @@ dependencies = [
     "torch==2.4.1",
     "tqdm==4.66.2",
     "trackio>=0.17.0",
+    "optuna>=3.6.1",
     "transformers==4.43.4",
 ]
 
