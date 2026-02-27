@@ -7,6 +7,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
+import os
+import sys
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
 import numpy as np
 import optuna
@@ -20,6 +26,8 @@ from data_provider.data_loader import Dataset_original, my_collate_fn_baseline
 from models import CPTransformer
 from utils import trackio_logging
 from utils.tools import get_parameter_number
+
+ACC_THRESHOLDS = (0.10, 0.15)
 
 
 @dataclass
@@ -81,6 +89,28 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
     )
 
 
+def preview_files(files: list[str], max_items: int = 6) -> str:
+    if not files:
+        return "[]"
+    if len(files) <= max_items:
+        return f"[{', '.join(files)}]"
+    head = ", ".join(files[: max_items // 2])
+    tail = ", ".join(files[-max_items // 2 :])
+    return f"[{head}, ..., {tail}]"
+
+
+def describe_dataset(ds: Dataset_original, name: str) -> None:
+    num_files = len(ds.files) if hasattr(ds, "files") else 0
+    num_samples = len(ds)
+    print(
+        f"[data] {name}: files={num_files} samples={num_samples} "
+        f"seq_len={ds.seq_len} early_cycle_threshold={ds.early_cycle_threshold} "
+        f"charge_discharge_length={ds.charge_discharge_len}"
+    )
+    if num_files:
+        print(f"[data] {name} file preview: {preview_files(ds.files)}")
+
+
 def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> SimpleNamespace:
     cfg = SimpleNamespace(**vars(base))
     cfg.seed = seed
@@ -104,15 +134,27 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
 
 
 def load_data(args: SimpleNamespace) -> CachedData:
+    print(
+        "[data] Loading datasets "
+        f"dataset={args.dataset} root_path={args.root_path} "
+        f"seq_len={args.seq_len} early_cycle_threshold={args.early_cycle_threshold} "
+        f"charge_discharge_length={args.charge_discharge_length}"
+    )
+    print("[data] Loading train split...")
     train_dataset = Dataset_original(args=args, flag="train", label_scaler=None)
+    describe_dataset(train_dataset, "train")
     label_scaler = train_dataset.return_label_scaler()
     life_class_scaler = train_dataset.return_life_class_scaler()
+    print("[data] Loading val split...")
     val_dataset = Dataset_original(
         args=args, flag="val", label_scaler=label_scaler, life_class_scaler=life_class_scaler
     )
+    describe_dataset(val_dataset, "val")
+    print("[data] Loading test split...")
     test_dataset = Dataset_original(
         args=args, flag="test", label_scaler=label_scaler, life_class_scaler=life_class_scaler
     )
+    describe_dataset(test_dataset, "test")
     return CachedData(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
@@ -154,7 +196,7 @@ def evaluate_loader(
     loader: DataLoader,
     device: torch.device,
     alpha1: float,
-) -> tuple[float, float]:
+) -> tuple[float, float, float, float]:
     preds = []
     refs = []
     std = np.sqrt(dataset.label_scaler.var_[-1])
@@ -173,7 +215,20 @@ def evaluate_loader(
     model.train()
     rmse = root_mean_squared_error(refs, preds)
     mape = mean_absolute_percentage_error(refs, preds)
-    return rmse, mape
+    acc10, acc15 = accuracy_at_pct(refs, preds)
+    return rmse, mape, acc10, acc15
+
+
+def accuracy_at_pct(refs: list[float], preds: list[float]) -> tuple[float, float]:
+    if not refs:
+        return 0.0, 0.0
+    refs_arr = np.asarray(refs, dtype=np.float64)
+    preds_arr = np.asarray(preds, dtype=np.float64)
+    denom = np.maximum(np.abs(refs_arr), 1e-8)
+    ape = np.abs(preds_arr - refs_arr) / denom
+    acc10 = float(np.mean(ape <= ACC_THRESHOLDS[0]))
+    acc15 = float(np.mean(ape <= ACC_THRESHOLDS[1]))
+    return acc10, acc15
 
 
 def train_one_trial(
@@ -219,6 +274,20 @@ def train_one_trial(
     run_config["model_total_params"] = para_res["Total"]
     run_config["model_trainable_params"] = para_res["Trainable"]
     run_config["model_trainable_percent"] = para_res["Percent"]
+
+    print(
+        f"[trial {trial.number}] "
+        f"seed={args.seed} device={device.type} "
+        f"batch_size={args.batch_size} lr={args.learning_rate:.3e} wd={args.wd:.3e} "
+        f"d_model={args.d_model} n_heads={args.n_heads} e_layers={args.e_layers} d_layers={args.d_layers} "
+        f"d_ff={args.d_ff} dropout={args.dropout} lradj={args.lradj} "
+        f"accumulation_steps={args.accumulation_steps}"
+    )
+    print(
+        f"[trial {trial.number}] "
+        f"train_samples={len(cached.train_dataset)} val_samples={len(cached.val_dataset)} "
+        f"test_samples={len(cached.test_dataset)} steps_per_epoch={len(train_loader)}"
+    )
 
     trackio_logging.init(project=trackio_project, config=run_config, name=run_name)
     best_val_mape = float("inf")
@@ -267,22 +336,43 @@ def train_one_trial(
                 scheduler.step()
 
             train_mape = mean_absolute_percentage_error(total_refs, total_preds)
+            train_acc10, train_acc15 = accuracy_at_pct(total_refs, total_preds)
             train_loss = total_loss / max(len(train_loader), 1)
-            val_rmse, val_mape = evaluate_loader(model, cached.val_dataset, val_loader, device, args.alpha1)
-            test_rmse, test_mape = evaluate_loader(model, cached.test_dataset, test_loader, device, args.alpha1)
+            val_rmse, val_mape, val_acc10, val_acc15 = evaluate_loader(
+                model, cached.val_dataset, val_loader, device, args.alpha1
+            )
+            test_rmse, test_mape, test_acc10, test_acc15 = evaluate_loader(
+                model, cached.test_dataset, test_loader, device, args.alpha1
+            )
             if val_mape < best_val_mape:
                 best_val_mape = val_mape
                 best_test_mape = test_mape
+
+            print(
+                f"[trial {trial.number}] epoch={epoch + 1}/{args.train_epochs} "
+                f"train_loss={train_loss:.6f} train_mape={train_mape:.6f} "
+                f"train_acc10={train_acc10:.4f} train_acc15={train_acc15:.4f} "
+                f"val_rmse={val_rmse:.6f} val_mape={val_mape:.6f} "
+                f"val_acc10={val_acc10:.4f} val_acc15={val_acc15:.4f} "
+                f"test_rmse={test_rmse:.6f} test_mape={test_mape:.6f} "
+                f"test_acc10={test_acc10:.4f} test_acc15={test_acc15:.4f}"
+            )
 
             trackio_logging.log(
                 {
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "train_mape": train_mape,
+                    "train_acc10": train_acc10,
+                    "train_acc15": train_acc15,
                     "vali_RMSE": val_rmse,
                     "vali_MAPE": val_mape,
+                    "vali_acc10": val_acc10,
+                    "vali_acc15": val_acc15,
                     "test_RMSE": test_rmse,
                     "test_MAPE": test_mape,
+                    "test_acc10": test_acc10,
+                    "test_acc15": test_acc15,
                 },
                 step=global_step,
             )
