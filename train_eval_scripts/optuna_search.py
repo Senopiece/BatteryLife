@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import random
 import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import List
 
@@ -24,35 +26,85 @@ class TrialResult:
     stdout: str
 
 
-def run_training(cmd: List[str]) -> TrialResult:
-    proc = subprocess.run(
+def run_training(cmd: List[str], trial_timeout_sec: int, idle_timeout_sec: int) -> TrialResult:
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        check=False,
+        bufsize=1,
     )
-    out = proc.stdout
-    if proc.returncode != 0:
-        raise RuntimeError(f"training failed (code={proc.returncode}). Output:\n{out}")
-    match = None
-    for line in reversed(out.splitlines()):
-        match = BEST_RE.search(line)
-        if match:
-            break
-    if not match:
-        raise RuntimeError(f"could not parse Val MAPE from output.\nOutput tail:\n{out[-4000:]}")
+    if proc.stdout is None:
+        raise RuntimeError("failed to capture subprocess stdout")
+
+    start_time = time.time()
+    last_output_time = start_time
+    tail = collections.deque(maxlen=2000)
+    best_match = None
     size_match = None
-    for line in out.splitlines():
-        size_match = MODEL_SIZE_RE.search(line)
-        if size_match:
-            break
+
+    try:
+        while True:
+            line = proc.stdout.readline()
+            now = time.time()
+            if line:
+                tail.append(line)
+                last_output_time = now
+                m = BEST_RE.search(line)
+                if m:
+                    best_match = m
+                s = MODEL_SIZE_RE.search(line)
+                if s:
+                    size_match = s
+            elif proc.poll() is not None:
+                break
+
+            elapsed = now - start_time
+            idle = now - last_output_time
+            if trial_timeout_sec > 0 and elapsed > trial_timeout_sec:
+                proc.kill()
+                raise RuntimeError(
+                    f"trial timed out after {trial_timeout_sec}s. Output tail:\n{''.join(tail)}"
+                )
+            if idle_timeout_sec > 0 and idle > idle_timeout_sec:
+                proc.kill()
+                raise RuntimeError(
+                    f"trial produced no output for {idle_timeout_sec}s. Output tail:\n{''.join(tail)}"
+                )
+
+        remaining = proc.stdout.read()
+        if remaining:
+            tail.append(remaining)
+            m = BEST_RE.search(remaining)
+            if m:
+                best_match = m
+            s = MODEL_SIZE_RE.search(remaining)
+            if s:
+                size_match = s
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+        raise
+    finally:
+        proc.stdout.close()
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"training failed (code={proc.returncode}). Output tail:\n{''.join(tail)}"
+        )
+    if not best_match:
+        raise RuntimeError(
+            f"could not parse Val MAPE from output. Output tail:\n{''.join(tail)}"
+        )
     if not size_match:
-        raise RuntimeError(f"could not parse model size from output.\nOutput tail:\n{out[-4000:]}")
+        raise RuntimeError(
+            f"could not parse model size from output. Output tail:\n{''.join(tail)}"
+        )
     return TrialResult(
-        val_mape=float(match.group(1)),
+        val_mape=float(best_match.group(1)),
         model_size=int(size_match.group(1)),
-        stdout=out,
+        stdout="".join(tail),
     )
 
 
@@ -147,6 +199,8 @@ def main() -> int:
     parser.add_argument("--root-path", type=str, default="./dataset")
     parser.add_argument("--trackio-project", type=str, default="")
     parser.add_argument("--extra-args", type=str, default="")
+    parser.add_argument("--trial-timeout-sec", type=int, default=7200)
+    parser.add_argument("--idle-timeout-sec", type=int, default=1800)
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
@@ -169,12 +223,18 @@ def main() -> int:
 
     def objective(trial: optuna.Trial) -> tuple[float, int]:
         cmd = build_command(args, trial)
-        result = run_training(cmd)
+        result = run_training(
+            cmd, trial_timeout_sec=args.trial_timeout_sec, idle_timeout_sec=args.idle_timeout_sec
+        )
         trial.set_user_attr("command", " ".join(shlex.quote(c) for c in cmd))
         trial.set_user_attr("model_size", result.model_size)
         return result.val_mape, result.model_size
 
-    study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=(RuntimeError,))
+    try:
+        study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=(RuntimeError,))
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Progress is saved in Optuna storage; rerun the same command to resume.")
+        return 130
 
     print("Pareto-optimal trials:")
     for t in study.best_trials:
