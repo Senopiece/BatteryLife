@@ -470,7 +470,7 @@ def main() -> int:
     parser.add_argument("--weighted_sampling", action="store_true", default=False)
     parser.add_argument("--train-epochs", type=int, default=100)
     parser.add_argument("--seq-len", type=int, default=10)
-    parser.add_argument("--charge-discharge-length", type=int, default=100)
+    parser.add_argument("--charge-discharge-length", type=int, default=300)
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
     parser.add_argument("--patience", type=int, default=50)
     args = parser.parse_args()
