@@ -8,8 +8,9 @@
     "XLA_FLAGS": "--xla_gpu_cuda_data_dir=/usr/local/cuda"
   },
   "mounts": [
-    "type=bind,source=${localEnv:USERPROFILE}\\.ssh,target=/root/.ssh,readonly"
+    "type=bind,source=${localEnv:USERPROFILE}\\.ssh,target=/mnt/host-ssh,readonly"
   ],
+  "postStartCommand": "bash .devcontainer/setup-ssh.sh",
   "updateContentCommand": "bash .devcontainer/install-dev-tools.sh",
   "customizations": {
     "vscode": {
