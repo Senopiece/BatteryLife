@@ -14,11 +14,13 @@ import optuna
 
 
 BEST_RE = re.compile(r"Val MAPE: ([0-9.]+)")
+MODEL_SIZE_RE = re.compile(r"(?:'Total'|\"Total\"|Total)\s*:\s*([0-9]+)")
 
 
 @dataclass
 class TrialResult:
     val_mape: float
+    model_size: int
     stdout: str
 
 
@@ -40,7 +42,18 @@ def run_training(cmd: List[str]) -> TrialResult:
             break
     if not match:
         raise RuntimeError(f"could not parse Val MAPE from output.\nOutput tail:\n{out[-4000:]}")
-    return TrialResult(val_mape=float(match.group(1)), stdout=out)
+    size_match = None
+    for line in out.splitlines():
+        size_match = MODEL_SIZE_RE.search(line)
+        if size_match:
+            break
+    if not size_match:
+        raise RuntimeError(f"could not parse model size from output.\nOutput tail:\n{out[-4000:]}")
+    return TrialResult(
+        val_mape=float(match.group(1)),
+        model_size=int(size_match.group(1)),
+        stdout=out,
+    )
 
 
 def build_command(args: argparse.Namespace, trial: optuna.Trial) -> List[str]:
@@ -48,15 +61,14 @@ def build_command(args: argparse.Namespace, trial: optuna.Trial) -> List[str]:
     wd = trial.suggest_float("wd", 0.0, 1e-3)
     batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
     d_model = trial.suggest_categorical("d_model", [16, 32, 64, 128])
-    n_heads = trial.suggest_categorical("n_heads", [2, 4, 8])
+    n_heads = trial.suggest_categorical("n_heads", [2, 4, 8, 16, 24, 32])
     e_layers = trial.suggest_categorical("e_layers", [1, 2, 3, 4])
-    d_layers = trial.suggest_categorical("d_layers", [1, 2, 3])
+    d_layers = trial.suggest_categorical("d_layers", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
     d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256])
     dropout = trial.suggest_float("dropout", 0.0, 0.3)
     lradj = trial.suggest_categorical("lradj", ["constant", "COS"])
     pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
     seq_len = trial.suggest_categorical("seq_len", [5, 10, 20])
-    train_epochs = trial.suggest_categorical("train_epochs", [10, 20, 30])
 
     cmd = [
         args.python,
@@ -105,8 +117,6 @@ def build_command(args: argparse.Namespace, trial: optuna.Trial) -> List[str]:
         str(pct_start),
         "--seq_len",
         str(seq_len),
-        "--train_epochs",
-        str(train_epochs),
     ]
 
     if args.extra_args:
@@ -130,27 +140,36 @@ def main() -> int:
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
     args.seed = seed
     sampler = optuna.samplers.TPESampler(seed=seed)
-    study = optuna.create_study(
-        study_name=args.study_name,
-        storage=args.storage,
-        load_if_exists=True,
-        sampler=sampler,
-        direction="minimize",
-    )
+    try:
+        study = optuna.create_study(
+            study_name=args.study_name,
+            storage=args.storage,
+            load_if_exists=True,
+            sampler=sampler,
+            directions=["minimize", "minimize"],
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc}\nUse a new --study-name for multi-objective search or a new --storage database."
+        ) from exc
     project = args.trackio_project or args.study_name
     print(f'Trackio: trackio show --project "{project}"')
 
-    def objective(trial: optuna.Trial) -> float:
+    def objective(trial: optuna.Trial) -> tuple[float, int]:
         cmd = build_command(args, trial)
         result = run_training(cmd)
         trial.set_user_attr("command", " ".join(shlex.quote(c) for c in cmd))
-        return result.val_mape
+        trial.set_user_attr("model_size", result.model_size)
+        return result.val_mape, result.model_size
 
     study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=(RuntimeError,))
 
-    print("Best trial:", study.best_trial.number)
-    print("Best Val MAPE:", study.best_value)
-    print("Best params:", study.best_params)
+    print("Pareto-optimal trials:")
+    for t in study.best_trials:
+        print(
+            f"  trial={t.number} val_mape={t.values[0]:.6f} model_size={int(t.values[1])} "
+            f"params={t.params}"
+        )
     return 0
 
 
