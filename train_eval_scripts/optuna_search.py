@@ -125,7 +125,7 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     )
     cfg.d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256])
     cfg.dropout = trial.suggest_float("dropout", 0.0, 0.3)
-    cfg.lradj = trial.suggest_categorical("lradj", ["constant", "COS"])
+    cfg.lradj = trial.suggest_categorical("lradj", ["constant", "COS", "onecycle"])
     cfg.pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
     cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8])
     cfg.factor = trial.suggest_categorical("factor", [1, 2, 3, 5])
@@ -258,8 +258,10 @@ def train_one_trial(
         [p for p in model.parameters() if p.requires_grad], lr=args.learning_rate, weight_decay=args.wd
     )
     if args.lradj == "COS":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(model_optim, T_max=max(args.train_epochs, 1), eta_min=1e-8)
-    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            model_optim, T_max=max(args.train_epochs, 1), eta_min=1e-8
+        )
+    elif args.lradj == "onecycle":
         scheduler = lr_scheduler.OneCycleLR(
             optimizer=model_optim,
             steps_per_epoch=max(len(train_loader), 1),
@@ -267,6 +269,8 @@ def train_one_trial(
             epochs=args.train_epochs,
             max_lr=args.learning_rate,
         )
+    else:
+        scheduler = None
 
     criterion = nn.MSELoss(reduction="none")
     run_name = f"{args.model_comment}_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -292,6 +296,7 @@ def train_one_trial(
     trackio_logging.init(project=trackio_project, config=run_config, name=run_name)
     best_val_mape = float("inf")
     best_test_mape = float("inf")
+    epochs_since_improve = 0
     try:
         global_step = 0
         for epoch in range(args.train_epochs):
@@ -316,7 +321,7 @@ def train_one_trial(
                 if (i + 1) % args.accumulation_steps == 0:
                     model_optim.step()
                     model_optim.zero_grad(set_to_none=True)
-                    if args.lradj != "COS":
+                    if args.lradj == "onecycle" and scheduler is not None:
                         scheduler.step()
                 total_loss += loss.detach().item() * args.accumulation_steps
 
@@ -329,10 +334,10 @@ def train_one_trial(
             if len(train_loader) % args.accumulation_steps != 0:
                 model_optim.step()
                 model_optim.zero_grad(set_to_none=True)
-                if args.lradj != "COS":
+                if args.lradj == "onecycle" and scheduler is not None:
                     scheduler.step()
 
-            if args.lradj == "COS":
+            if args.lradj == "COS" and scheduler is not None:
                 scheduler.step()
 
             train_mape = mean_absolute_percentage_error(total_refs, total_preds)
@@ -347,6 +352,9 @@ def train_one_trial(
             if val_mape < best_val_mape:
                 best_val_mape = val_mape
                 best_test_mape = test_mape
+                epochs_since_improve = 0
+            else:
+                epochs_since_improve += 1
 
             print(
                 f"[trial {trial.number}] epoch={epoch + 1}/{args.train_epochs} "
@@ -376,6 +384,13 @@ def train_one_trial(
                 },
                 step=global_step,
             )
+
+            if args.patience > 0 and epochs_since_improve >= args.patience:
+                print(
+                    f"[trial {trial.number}] early stop: no val_mape improvement for "
+                    f"{args.patience} epochs"
+                )
+                break
 
             if trial_timeout_sec > 0 and (time.time() - trial_start) > trial_timeout_sec:
                 raise RuntimeError(f"trial timed out after {trial_timeout_sec}s")
@@ -415,6 +430,7 @@ def main() -> int:
     parser.add_argument("--seq-len", type=int, default=10)
     parser.add_argument("--charge-discharge-length", type=int, default=100)
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
+    parser.add_argument("--patience", type=int, default=50)
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
