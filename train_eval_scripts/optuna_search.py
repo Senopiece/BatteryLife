@@ -119,25 +119,25 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.wd = trial.suggest_float("wd", 0.0, 1e-3)
     cfg.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
     model_head_pairs = [
-        (16, 2),
-        (16, 4),
-        (16, 8),
-        (16, 16),
-        (32, 2),
-        (32, 4),
-        (32, 8),
-        (32, 16),
-        (32, 32),
-        (64, 2),
-        (64, 4),
-        (64, 8),
-        (64, 16),
-        (64, 32),
-        (128, 2),
-        (128, 4),
-        (128, 8),
-        (128, 16),
-        (128, 32),
+        [16, 2],
+        [16, 4],
+        [16, 8],
+        [16, 16],
+        [32, 2],
+        [32, 4],
+        [32, 8],
+        [32, 16],
+        [32, 32],
+        [64, 2],
+        [64, 4],
+        [64, 8],
+        [64, 16],
+        [64, 32],
+        [128, 2],
+        [128, 4],
+        [128, 8],
+        [128, 16],
+        [128, 32],
     ]
     cfg.d_model, cfg.n_heads = trial.suggest_categorical("model_heads", model_head_pairs)
     cfg.e_layers = trial.suggest_categorical("e_layers", [1, 2, 3, 4])
@@ -200,6 +200,8 @@ def make_loader(
         np.random.seed(worker_seed)
         torch.manual_seed(worker_seed)
 
+    effective_timeout = 0 if num_workers == 0 else timeout
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -209,7 +211,7 @@ def make_loader(
         collate_fn=my_collate_fn_baseline,
         generator=generator,
         worker_init_fn=seed_worker,
-        timeout=timeout,
+        timeout=effective_timeout,
     )
 
 
@@ -463,7 +465,7 @@ def main() -> int:
     parser.add_argument("--root-path", type=str, default="./dataset")
     parser.add_argument("--trackio-project", type=str, default="")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--dataloader-timeout", type=int, default=300)
+    parser.add_argument("--dataloader-timeout", type=int, default=0)
     parser.add_argument("--dataset", type=str, default="NAion")
     parser.add_argument("--early-cycle-threshold", type=int, default=100)
     parser.add_argument("--weighted_loss", action="store_true", default=False)
@@ -516,9 +518,12 @@ def main() -> int:
                 trial_timeout_sec=args.trial_timeout_sec,
             )
         except Exception as exc:
+            import traceback
+
             msg = f"trial failed: {exc!r}"
             trial.set_user_attr("failed", msg)
             print(f"[trial {trial.number}] {msg}")
+            print(f"[trial {trial.number}] traceback:\n{traceback.format_exc()}")
             raise optuna.TrialPruned(msg) from exc
         trial.set_user_attr("model_size", values[1])
         trial.set_user_attr("train_time_sec", values[2])
