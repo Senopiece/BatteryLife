@@ -54,6 +54,7 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
         data=args.data,
         root_path=args.root_path,
         num_workers=args.num_workers,
+        dataloader_timeout=args.dataloader_timeout,
         weighted_sampling=args.weighted_sampling,
         weighted_loss=args.weighted_loss,
         seq_len=args.seq_len,
@@ -186,6 +187,7 @@ def make_loader(
     dataset: Dataset_original,
     batch_size: int,
     num_workers: int,
+    timeout: int,
     train: bool,
     seed: int,
 ) -> DataLoader:
@@ -207,6 +209,7 @@ def make_loader(
         collate_fn=my_collate_fn_baseline,
         generator=generator,
         worker_init_fn=seed_worker,
+        timeout=timeout,
     )
 
 
@@ -261,13 +264,28 @@ def train_one_trial(
 ) -> tuple[float, int, float]:
     trial_start = time.time()
     train_loader = make_loader(
-        cached.train_dataset, args.batch_size, args.num_workers, train=True, seed=args.seed
+        cached.train_dataset,
+        args.batch_size,
+        args.num_workers,
+        args.dataloader_timeout,
+        train=True,
+        seed=args.seed,
     )
     val_loader = make_loader(
-        cached.val_dataset, args.batch_size, args.num_workers, train=False, seed=args.seed
+        cached.val_dataset,
+        args.batch_size,
+        args.num_workers,
+        args.dataloader_timeout,
+        train=False,
+        seed=args.seed,
     )
     test_loader = make_loader(
-        cached.test_dataset, args.batch_size, args.num_workers, train=False, seed=args.seed
+        cached.test_dataset,
+        args.batch_size,
+        args.num_workers,
+        args.dataloader_timeout,
+        train=False,
+        seed=args.seed,
     )
 
     model = CPTransformer.Model(args).float().to(device)
@@ -441,7 +459,8 @@ def main() -> int:
     parser.add_argument("--data", type=str, default="Dataset_original")
     parser.add_argument("--root-path", type=str, default="./dataset")
     parser.add_argument("--trackio-project", type=str, default="")
-    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--dataloader-timeout", type=int, default=300)
     parser.add_argument("--dataset", type=str, default="NAion")
     parser.add_argument("--early-cycle-threshold", type=int, default=100)
     parser.add_argument("--weighted_loss", action="store_true", default=False)
