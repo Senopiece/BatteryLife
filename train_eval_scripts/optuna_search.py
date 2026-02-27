@@ -2,214 +2,334 @@
 from __future__ import annotations
 
 import argparse
-import collections
 import random
-import re
-import shlex
-import subprocess
-import sys
 import time
 from dataclasses import dataclass
-from typing import List
+from datetime import datetime
+from types import SimpleNamespace
 
+import numpy as np
 import optuna
+import torch
+from sklearn.metrics import mean_absolute_percentage_error, root_mean_squared_error
+from torch import nn, optim
+from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader
 
-
-BEST_RE = re.compile(r"Val MAPE: ([0-9.]+)")
-MODEL_SIZE_RE = re.compile(r"(?:'Total'|\"Total\"|Total)\s*:\s*([0-9]+)")
+from data_provider.data_loader import Dataset_original, my_collate_fn_baseline
+from models import CPTransformer
+from utils import trackio_logging
+from utils.tools import get_parameter_number
 
 
 @dataclass
-class TrialResult:
-    val_mape: float
-    model_size: int
-    train_time_sec: float
-    stdout: str
+class CachedData:
+    train_dataset: Dataset_original
+    val_dataset: Dataset_original
+    test_dataset: Dataset_original
 
 
-def run_training(cmd: List[str], trial_timeout_sec: int, idle_timeout_sec: int) -> TrialResult:
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.enabled = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        # data
+        dataset=args.dataset,
+        data=args.data,
+        root_path=args.root_path,
+        num_workers=args.num_workers,
+        weighted_sampling=args.weighted_sampling,
+        weighted_loss=args.weighted_loss,
+        seq_len=args.seq_len,
+        charge_discharge_length=args.charge_discharge_length,
+        train_epochs=args.train_epochs,
+        # model/data defaults
+        early_cycle_threshold=args.early_cycle_threshold,
+        output_num=1,
+        activation="relu",
+        alpha1=0.15,
+        alpha2=0.1,
+        # fixed run defaults
+        task_name="long_term_forecast",
+        is_training=1,
+        model="CPTransformer",
+        model_id="optuna",
+        model_comment="none",
+        # placeholders overwritten per trial
+        learning_rate=1e-4,
+        wd=0.0,
+        batch_size=32,
+        d_model=64,
+        n_heads=4,
+        e_layers=2,
+        d_layers=2,
+        d_ff=128,
+        dropout=0.1,
+        lradj="constant",
+        pct_start=0.2,
+        accumulation_steps=1,
+        factor=1,
     )
-    if proc.stdout is None:
-        raise RuntimeError("failed to capture subprocess stdout")
 
-    start_time = time.time()
-    last_output_time = start_time
-    tail = collections.deque(maxlen=2000)
-    best_match = None
-    size_match = None
 
+def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> SimpleNamespace:
+    cfg = SimpleNamespace(**vars(base))
+    cfg.seed = seed
+    cfg.learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-3, log=True)
+    cfg.wd = trial.suggest_float("wd", 0.0, 1e-3)
+    cfg.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    cfg.d_model = trial.suggest_categorical("d_model", [16, 32, 64, 128])
+    cfg.n_heads = trial.suggest_categorical("n_heads", [2, 4, 8, 16, 24, 32])
+    cfg.e_layers = trial.suggest_categorical("e_layers", [1, 2, 3, 4])
+    cfg.d_layers = trial.suggest_categorical(
+        "d_layers", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    )
+    cfg.d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256])
+    cfg.dropout = trial.suggest_float("dropout", 0.0, 0.3)
+    cfg.lradj = trial.suggest_categorical("lradj", ["constant", "COS"])
+    cfg.pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
+    cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8])
+    cfg.factor = trial.suggest_categorical("factor", [1, 2, 3, 5])
+    cfg.model_comment = f"trial-{trial.number}"
+    return cfg
+
+
+def load_data(args: SimpleNamespace) -> CachedData:
+    train_dataset = Dataset_original(args=args, flag="train", label_scaler=None)
+    label_scaler = train_dataset.return_label_scaler()
+    life_class_scaler = train_dataset.return_life_class_scaler()
+    val_dataset = Dataset_original(
+        args=args, flag="val", label_scaler=label_scaler, life_class_scaler=life_class_scaler
+    )
+    test_dataset = Dataset_original(
+        args=args, flag="test", label_scaler=label_scaler, life_class_scaler=life_class_scaler
+    )
+    return CachedData(
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        test_dataset=test_dataset,
+    )
+
+
+def make_loader(
+    dataset: Dataset_original,
+    batch_size: int,
+    num_workers: int,
+    train: bool,
+    seed: int,
+) -> DataLoader:
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    def seed_worker(worker_id: int) -> None:
+        worker_seed = seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=train,
+        num_workers=num_workers,
+        drop_last=train,
+        collate_fn=my_collate_fn_baseline,
+        generator=generator,
+        worker_init_fn=seed_worker,
+    )
+
+
+def evaluate_loader(
+    model: nn.Module,
+    dataset: Dataset_original,
+    loader: DataLoader,
+    device: torch.device,
+    alpha1: float,
+) -> tuple[float, float]:
+    preds = []
+    refs = []
+    std = np.sqrt(dataset.label_scaler.var_[-1])
+    mean_value = dataset.label_scaler.mean_[-1]
+    model.eval()
+    with torch.no_grad():
+        for cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids in loader:
+            cycle_curve_data = cycle_curve_data.float().to(device)
+            curve_attn_mask = curve_attn_mask.float().to(device)
+            labels = labels.float().to(device)
+            outputs = model(cycle_curve_data, curve_attn_mask)
+            transformed_preds = outputs * std + mean_value
+            transformed_labels = labels * std + mean_value
+            preds.extend(transformed_preds.detach().cpu().numpy().reshape(-1).tolist())
+            refs.extend(transformed_labels.detach().cpu().numpy().reshape(-1).tolist())
+    model.train()
+    rmse = root_mean_squared_error(refs, preds)
+    mape = mean_absolute_percentage_error(refs, preds)
+    return rmse, mape
+
+
+def train_one_trial(
+    trial: optuna.Trial,
+    args: SimpleNamespace,
+    cached: CachedData,
+    device: torch.device,
+    trackio_project: str,
+    trial_timeout_sec: int,
+) -> tuple[float, int, float]:
+    trial_start = time.time()
+    train_loader = make_loader(
+        cached.train_dataset, args.batch_size, args.num_workers, train=True, seed=args.seed
+    )
+    val_loader = make_loader(
+        cached.val_dataset, args.batch_size, args.num_workers, train=False, seed=args.seed
+    )
+    test_loader = make_loader(
+        cached.test_dataset, args.batch_size, args.num_workers, train=False, seed=args.seed
+    )
+
+    model = CPTransformer.Model(args).float().to(device)
+    para_res = get_parameter_number(model)
+    model_size = int(para_res["Total"])
+
+    model_optim = optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=args.learning_rate, weight_decay=args.wd
+    )
+    if args.lradj == "COS":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(model_optim, T_max=max(args.train_epochs, 1), eta_min=1e-8)
+    else:
+        scheduler = lr_scheduler.OneCycleLR(
+            optimizer=model_optim,
+            steps_per_epoch=max(len(train_loader), 1),
+            pct_start=args.pct_start,
+            epochs=args.train_epochs,
+            max_lr=args.learning_rate,
+        )
+
+    criterion = nn.MSELoss(reduction="none")
+    run_name = f"{args.model_comment}_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    run_config = dict(vars(args))
+    run_config["model_total_params"] = para_res["Total"]
+    run_config["model_trainable_params"] = para_res["Trainable"]
+    run_config["model_trainable_percent"] = para_res["Percent"]
+
+    trackio_logging.init(project=trackio_project, config=run_config, name=run_name)
+    best_val_mape = float("inf")
+    best_test_mape = float("inf")
     try:
-        while True:
-            line = proc.stdout.readline()
-            now = time.time()
-            if line:
-                tail.append(line)
-                last_output_time = now
-                m = BEST_RE.search(line)
-                if m:
-                    best_match = m
-                s = MODEL_SIZE_RE.search(line)
-                if s:
-                    size_match = s
-            elif proc.poll() is not None:
-                break
+        global_step = 0
+        for epoch in range(args.train_epochs):
+            model.train()
+            total_loss = 0.0
+            std = np.sqrt(cached.train_dataset.label_scaler.var_[-1])
+            mean_value = cached.train_dataset.label_scaler.mean_[-1]
+            total_preds = []
+            total_refs = []
+            model_optim.zero_grad(set_to_none=True)
+            for i, (cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids) in enumerate(train_loader):
+                cycle_curve_data = cycle_curve_data.float().to(device)
+                curve_attn_mask = curve_attn_mask.float().to(device)
+                labels = labels.float().to(device)
+                weights = weights.float().to(device)
 
-            elapsed = now - start_time
-            idle = now - last_output_time
-            if trial_timeout_sec > 0 and elapsed > trial_timeout_sec:
-                proc.kill()
-                raise RuntimeError(
-                    f"trial timed out after {trial_timeout_sec}s. Output tail:\n{''.join(tail)}"
-                )
-            if idle_timeout_sec > 0 and idle > idle_timeout_sec:
-                proc.kill()
-                raise RuntimeError(
-                    f"trial produced no output for {idle_timeout_sec}s. Output tail:\n{''.join(tail)}"
-                )
+                outputs = model(cycle_curve_data, curve_attn_mask)
+                loss = criterion(outputs, labels)
+                loss = torch.mean(loss * weights) / args.accumulation_steps
+                loss.backward()
 
-        remaining = proc.stdout.read()
-        if remaining:
-            tail.append(remaining)
-            m = BEST_RE.search(remaining)
-            if m:
-                best_match = m
-            s = MODEL_SIZE_RE.search(remaining)
-            if s:
-                size_match = s
-    except BaseException:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=10)
-        raise
+                if (i + 1) % args.accumulation_steps == 0:
+                    model_optim.step()
+                    model_optim.zero_grad(set_to_none=True)
+                    if args.lradj != "COS":
+                        scheduler.step()
+                total_loss += loss.detach().item() * args.accumulation_steps
+
+                transformed_preds = outputs * std + mean_value
+                transformed_labels = labels * std + mean_value
+                total_preds.extend(transformed_preds.detach().cpu().numpy().reshape(-1).tolist())
+                total_refs.extend(transformed_labels.detach().cpu().numpy().reshape(-1).tolist())
+                global_step += 1
+
+            if len(train_loader) % args.accumulation_steps != 0:
+                model_optim.step()
+                model_optim.zero_grad(set_to_none=True)
+                if args.lradj != "COS":
+                    scheduler.step()
+
+            if args.lradj == "COS":
+                scheduler.step()
+
+            train_mape = mean_absolute_percentage_error(total_refs, total_preds)
+            train_loss = total_loss / max(len(train_loader), 1)
+            val_rmse, val_mape = evaluate_loader(model, cached.val_dataset, val_loader, device, args.alpha1)
+            test_rmse, test_mape = evaluate_loader(model, cached.test_dataset, test_loader, device, args.alpha1)
+            if val_mape < best_val_mape:
+                best_val_mape = val_mape
+                best_test_mape = test_mape
+
+            trackio_logging.log(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "train_mape": train_mape,
+                    "vali_RMSE": val_rmse,
+                    "vali_MAPE": val_mape,
+                    "test_RMSE": test_rmse,
+                    "test_MAPE": test_mape,
+                },
+                step=global_step,
+            )
+
+            if trial_timeout_sec > 0 and (time.time() - trial_start) > trial_timeout_sec:
+                raise RuntimeError(f"trial timed out after {trial_timeout_sec}s")
+
+        train_time_sec = time.time() - trial_start
+        trackio_logging.log(
+            {
+                "best_vali_MAPE": best_val_mape,
+                "best_test_MAPE": best_test_mape,
+                "train_time_sec": train_time_sec,
+                "model_total_params": model_size,
+            }
+        )
+        return best_val_mape, model_size, train_time_sec
     finally:
-        proc.stdout.close()
-
-    end_time = time.time()
-    train_time_sec = end_time - start_time
-
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"training failed (code={proc.returncode}). Output tail:\n{''.join(tail)}"
-        )
-    if not best_match:
-        raise RuntimeError(
-            f"could not parse Val MAPE from output. Output tail:\n{''.join(tail)}"
-        )
-    if not size_match:
-        raise RuntimeError(
-            f"could not parse model size from output. Output tail:\n{''.join(tail)}"
-        )
-    return TrialResult(
-        val_mape=float(best_match.group(1)),
-        model_size=int(size_match.group(1)),
-        train_time_sec=train_time_sec,
-        stdout="".join(tail),
-    )
-
-
-def build_command(args: argparse.Namespace, trial: optuna.Trial) -> List[str]:
-    lr = trial.suggest_float("learning_rate", 1e-5, 5e-3, log=True)
-    wd = trial.suggest_float("wd", 0.0, 1e-3)
-    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
-    d_model = trial.suggest_categorical("d_model", [16, 32, 64, 128])
-    n_heads = trial.suggest_categorical("n_heads", [2, 4, 8, 16, 24, 32])
-    e_layers = trial.suggest_categorical("e_layers", [1, 2, 3, 4])
-    d_layers = trial.suggest_categorical("d_layers", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
-    d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256])
-    dropout = trial.suggest_float("dropout", 0.0, 0.3)
-    lradj = trial.suggest_categorical("lradj", ["constant", "COS"])
-    pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
-    seq_len = trial.suggest_categorical("seq_len", [5, 10, 20])
-    pred_len = trial.suggest_categorical("pred_len", [3, 5, 10, 20])
-    accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8])
-    factor = trial.suggest_categorical("factor", [1, 2, 3, 5])
-    charge_discharge_length = trial.suggest_categorical("charge_discharge_length", [80, 100, 120, 150])
-
-    cmd = [
-        args.python,
-        "run_main.py",
-        "--model",
-        "CPTransformer",
-        "--dataset",
-        "NAion",
-        "--data",
-        args.data,
-        "--is_training",
-        "1",
-        "--itr",
-        "1",
-        "--model_id",
-        "optuna",
-        "--model_comment",
-        f"trial-{trial.number}",
-        "--seed",
-        str(args.seed),
-        "--trackio_project",
-        args.trackio_project or args.study_name,
-        "--root_path",
-        args.root_path,
-        "--learning_rate",
-        str(lr),
-        "--wd",
-        str(wd),
-        "--batch_size",
-        str(batch_size),
-        "--d_model",
-        str(d_model),
-        "--n_heads",
-        str(n_heads),
-        "--e_layers",
-        str(e_layers),
-        "--d_layers",
-        str(d_layers),
-        "--d_ff",
-        str(d_ff),
-        "--dropout",
-        str(dropout),
-        "--lradj",
-        str(lradj),
-        "--pct_start",
-        str(pct_start),
-        "--seq_len",
-        str(seq_len),
-        "--pred_len",
-        str(pred_len),
-        "--accumulation_steps",
-        str(accumulation_steps),
-        "--factor",
-        str(factor),
-        "--charge_discharge_length",
-        str(charge_discharge_length),
-    ]
-
-    if args.extra_args:
-        cmd.extend(shlex.split(args.extra_args))
-    return cmd
+        trackio_logging.finish()
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Optuna search for CPTransformer on NAion")
+    parser = argparse.ArgumentParser(description="In-process Optuna search for CPTransformer on NAion")
     parser.add_argument("--trials", type=int, default=100)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--storage", type=str, default="sqlite:///optuna_cptransformer_naion.db")
     parser.add_argument("--study-name", type=str, default="cptransformer_naion")
-    parser.add_argument("--python", type=str, default=sys.executable)
     parser.add_argument("--data", type=str, default="Dataset_original")
     parser.add_argument("--root-path", type=str, default="./dataset")
     parser.add_argument("--trackio-project", type=str, default="")
-    parser.add_argument("--extra-args", type=str, default="")
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--dataset", type=str, default="NAion")
+    parser.add_argument("--early-cycle-threshold", type=int, default=100)
+    parser.add_argument("--weighted_loss", action="store_true", default=False)
+    parser.add_argument("--weighted_sampling", action="store_true", default=False)
+    parser.add_argument("--train-epochs", type=int, default=100)
+    parser.add_argument("--seq-len", type=int, default=10)
+    parser.add_argument("--charge-discharge-length", type=int, default=100)
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
-    parser.add_argument("--idle-timeout-sec", type=int, default=1800)
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
-    args.seed = seed
+    set_seed(seed)
+
     sampler = optuna.samplers.TPESampler(seed=seed)
     try:
         study = optuna.create_study(
@@ -221,20 +341,31 @@ def main() -> int:
         )
     except ValueError as exc:
         raise ValueError(
-            f"{exc}\nUse a new --study-name for multi-objective search or a new --storage database."
+            f"{exc}\nUse a new --study-name for this objective setup or a new --storage database."
         ) from exc
+
     project = args.trackio_project or args.study_name
     print(f'Trackio: trackio show --project "{project}"')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    base_args = build_base_args(args)
+    cached = load_data(base_args)
 
     def objective(trial: optuna.Trial) -> tuple[float, int, float]:
-        cmd = build_command(args, trial)
-        result = run_training(
-            cmd, trial_timeout_sec=args.trial_timeout_sec, idle_timeout_sec=args.idle_timeout_sec
+        trial_seed = seed + trial.number * 9973
+        set_seed(trial_seed)
+        trial_args = build_trial_args(base_args, trial, seed=trial_seed)
+        values = train_one_trial(
+            trial=trial,
+            args=trial_args,
+            cached=cached,
+            device=device,
+            trackio_project=project,
+            trial_timeout_sec=args.trial_timeout_sec,
         )
-        trial.set_user_attr("command", " ".join(shlex.quote(c) for c in cmd))
-        trial.set_user_attr("model_size", result.model_size)
-        trial.set_user_attr("train_time_sec", result.train_time_sec)
-        return result.val_mape, result.model_size, result.train_time_sec
+        trial.set_user_attr("model_size", values[1])
+        trial.set_user_attr("train_time_sec", values[2])
+        trial.set_user_attr("trial_seed", trial_seed)
+        return values
 
     try:
         study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=(RuntimeError,))
@@ -245,9 +376,8 @@ def main() -> int:
     print("Pareto-optimal trials:")
     for t in study.best_trials:
         print(
-            f"  trial={t.number} val_mape={t.values[0]:.6f} model_size={int(t.values[1])} "
-            f"train_time_sec={t.values[2]:.2f} "
-            f"params={t.params}"
+            f"  trial={t.number} val_mape={t.values[0]:.6f} "
+            f"model_size={int(t.values[1])} train_time_sec={t.values[2]:.2f} params={t.params}"
         )
     return 0
 
