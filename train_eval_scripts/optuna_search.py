@@ -23,6 +23,7 @@ MODEL_SIZE_RE = re.compile(r"(?:'Total'|\"Total\"|Total)\s*:\s*([0-9]+)")
 class TrialResult:
     val_mape: float
     model_size: int
+    train_time_sec: float
     stdout: str
 
 
@@ -89,6 +90,9 @@ def run_training(cmd: List[str], trial_timeout_sec: int, idle_timeout_sec: int) 
     finally:
         proc.stdout.close()
 
+    end_time = time.time()
+    train_time_sec = end_time - start_time
+
     if proc.returncode != 0:
         raise RuntimeError(
             f"training failed (code={proc.returncode}). Output tail:\n{''.join(tail)}"
@@ -104,6 +108,7 @@ def run_training(cmd: List[str], trial_timeout_sec: int, idle_timeout_sec: int) 
     return TrialResult(
         val_mape=float(best_match.group(1)),
         model_size=int(size_match.group(1)),
+        train_time_sec=train_time_sec,
         stdout="".join(tail),
     )
 
@@ -212,7 +217,7 @@ def main() -> int:
             storage=args.storage,
             load_if_exists=True,
             sampler=sampler,
-            directions=["minimize", "minimize"],
+            directions=["minimize", "minimize", "minimize"],
         )
     except ValueError as exc:
         raise ValueError(
@@ -221,14 +226,15 @@ def main() -> int:
     project = args.trackio_project or args.study_name
     print(f'Trackio: trackio show --project "{project}"')
 
-    def objective(trial: optuna.Trial) -> tuple[float, int]:
+    def objective(trial: optuna.Trial) -> tuple[float, int, float]:
         cmd = build_command(args, trial)
         result = run_training(
             cmd, trial_timeout_sec=args.trial_timeout_sec, idle_timeout_sec=args.idle_timeout_sec
         )
         trial.set_user_attr("command", " ".join(shlex.quote(c) for c in cmd))
         trial.set_user_attr("model_size", result.model_size)
-        return result.val_mape, result.model_size
+        trial.set_user_attr("train_time_sec", result.train_time_sec)
+        return result.val_mape, result.model_size, result.train_time_sec
 
     try:
         study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=(RuntimeError,))
@@ -240,6 +246,7 @@ def main() -> int:
     for t in study.best_trials:
         print(
             f"  trial={t.number} val_mape={t.values[0]:.6f} model_size={int(t.values[1])} "
+            f"train_time_sec={t.values[2]:.2f} "
             f"params={t.params}"
         )
     return 0
