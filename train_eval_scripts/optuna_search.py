@@ -69,6 +69,10 @@ def build_command(args: argparse.Namespace, trial: optuna.Trial) -> List[str]:
     lradj = trial.suggest_categorical("lradj", ["constant", "COS"])
     pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
     seq_len = trial.suggest_categorical("seq_len", [5, 10, 20])
+    pred_len = trial.suggest_categorical("pred_len", [3, 5, 10, 20])
+    accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8])
+    factor = trial.suggest_categorical("factor", [1, 2, 3, 5])
+    charge_discharge_length = trial.suggest_categorical("charge_discharge_length", [80, 100, 120, 150])
 
     cmd = [
         args.python,
@@ -86,7 +90,7 @@ def build_command(args: argparse.Namespace, trial: optuna.Trial) -> List[str]:
         "--model_id",
         "optuna",
         "--model_comment",
-        f"optuna-trial-{trial.number}",
+        f"trial-{trial.number}",
         "--seed",
         str(args.seed),
         "--trackio_project",
@@ -117,6 +121,14 @@ def build_command(args: argparse.Namespace, trial: optuna.Trial) -> List[str]:
         str(pct_start),
         "--seq_len",
         str(seq_len),
+        "--pred_len",
+        str(pred_len),
+        "--accumulation_steps",
+        str(accumulation_steps),
+        "--factor",
+        str(factor),
+        "--charge_discharge_length",
+        str(charge_discharge_length),
     ]
 
     if args.extra_args:

@@ -109,7 +109,7 @@ parser.add_argument('--itr', type=int, default=1, help='experiments times')
 parser.add_argument('--train_epochs', type=int, default=100, help='train epochs')
 parser.add_argument('--least_epochs', type=int, default=5, help='The model is trained at least some epoches before the early stopping is used')
 parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
-parser.add_argument('--patience', type=int, default=1000, help='early stopping patience')
+parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
 parser.add_argument('--learning_rate', type=float, default=0.0001, help='optimizer learning rate')
 parser.add_argument('--wd', type=float, default=0.0, help='weight decay')
 parser.add_argument('--des', type=str, default='test', help='exp description')
@@ -132,6 +132,8 @@ args = parser.parse_args()
 
 
 nowtime = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+run_name_prefix = args.model_comment if args.model_comment else "run"
+run_name = f"{run_name_prefix}_{nowtime}"
 set_seed(args.seed)
 ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 deepspeed_plugin = DeepSpeedPlugin(hf_ds_config='./ds_config_zero2_baseline.json')
@@ -196,7 +198,12 @@ for ii in range(args.itr):
         model = CPTransformer.Model(args).float()
     else:
         raise Exception(f'The {args.model} is not an implemented baseline!')
-        
+    
+    para_res = get_parameter_number(model)
+    run_config = dict(args.__dict__)
+    run_config["model_total_params"] = para_res["Total"]
+    run_config["model_trainable_params"] = para_res["Trainable"]
+    run_config["model_trainable_percent"] = para_res["Percent"]
     
     path = os.path.join(args.checkpoints,
                         setting + '-' + args.model_comment)  # unique checkpoint saving path
@@ -220,19 +227,18 @@ for ii in range(args.itr):
     joblib.dump(label_scaler, f'{path}/label_scaler')
     joblib.dump(life_class_scaler, f'{path}/life_class_scaler')
     with open(path+'/args.json', 'w') as f:
-        json.dump(args.__dict__, f)
+        json.dump(run_config, f)
     if accelerator.is_local_main_process:
         trackio_logging.init(
         # set the wandb project where this run will be logged
         project=args.trackio_project,
         
         # track hyperparameters and run metadata
-        config=args.__dict__,
-        name=nowtime
+        config=run_config,
+        name=run_name
         )
 
 
-    para_res = get_parameter_number(model)
     accelerator.print(para_res)
         
     for name, module in model._modules.items():
