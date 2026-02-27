@@ -118,7 +118,8 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.wd = trial.suggest_float("wd", 0.0, 1e-3)
     cfg.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
     cfg.d_model = trial.suggest_categorical("d_model", [16, 32, 64, 128])
-    cfg.n_heads = trial.suggest_categorical("n_heads", [2, 4, 8, 16, 24, 32])
+    valid_heads = [h for h in [2, 4, 8, 16, 24, 32] if cfg.d_model % h == 0]
+    cfg.n_heads = trial.suggest_categorical("n_heads", valid_heads)
     cfg.e_layers = trial.suggest_categorical("e_layers", [1, 2, 3, 4])
     cfg.d_layers = trial.suggest_categorical(
         "d_layers", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
@@ -460,21 +461,31 @@ def main() -> int:
         trial_seed = seed + trial.number * 9973
         set_seed(trial_seed)
         trial_args = build_trial_args(base_args, trial, seed=trial_seed)
-        values = train_one_trial(
-            trial=trial,
-            args=trial_args,
-            cached=cached,
-            device=device,
-            trackio_project=project,
-            trial_timeout_sec=args.trial_timeout_sec,
-        )
+        if trial_args.d_model % trial_args.n_heads != 0:
+            msg = f"invalid config: d_model={trial_args.d_model} not divisible by n_heads={trial_args.n_heads}"
+            trial.set_user_attr("failed", msg)
+            raise optuna.TrialPruned(msg)
+        try:
+            values = train_one_trial(
+                trial=trial,
+                args=trial_args,
+                cached=cached,
+                device=device,
+                trackio_project=project,
+                trial_timeout_sec=args.trial_timeout_sec,
+            )
+        except Exception as exc:
+            msg = f"trial failed: {exc!r}"
+            trial.set_user_attr("failed", msg)
+            print(f"[trial {trial.number}] {msg}")
+            raise optuna.TrialPruned(msg) from exc
         trial.set_user_attr("model_size", values[1])
         trial.set_user_attr("train_time_sec", values[2])
         trial.set_user_attr("trial_seed", trial_seed)
         return values
 
     try:
-        study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=(RuntimeError,))
+        study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=())
     except KeyboardInterrupt:
         print("\nInterrupted by user. Progress is saved in Optuna storage; rerun the same command to resume.")
         return 130
