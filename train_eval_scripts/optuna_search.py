@@ -334,6 +334,7 @@ def train_one_trial(
     trackio_logging.init(project=trackio_project, config=run_config, name=run_name)
     best_val_mape = float("inf")
     best_test_mape = float("inf")
+    best_time_sec = 0.0
     epochs_since_improve = 0
     try:
         global_step = 0
@@ -390,6 +391,7 @@ def train_one_trial(
             if val_mape < best_val_mape:
                 best_val_mape = val_mape
                 best_test_mape = test_mape
+                best_time_sec = time.time() - trial_start
                 epochs_since_improve = 0
             else:
                 epochs_since_improve += 1
@@ -439,10 +441,11 @@ def train_one_trial(
                 "best_vali_MAPE": best_val_mape,
                 "best_test_MAPE": best_test_mape,
                 "train_time_sec": train_time_sec,
+                "best_time_sec": best_time_sec,
                 "model_total_params": model_size,
             }
         )
-        return best_val_mape, model_size, train_time_sec
+        return best_val_mape, model_size, best_time_sec
     finally:
         trackio_logging.finish()
         del model
