@@ -60,6 +60,7 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
         seq_len=args.seq_len,
         charge_discharge_length=args.charge_discharge_length,
         train_epochs=args.train_epochs,
+        patience=args.patience,
         # model/data defaults
         early_cycle_threshold=args.early_cycle_threshold,
         output_num=1,
@@ -117,9 +118,28 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-3, log=True)
     cfg.wd = trial.suggest_float("wd", 0.0, 1e-3)
     cfg.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
-    cfg.d_model = trial.suggest_categorical("d_model", [16, 32, 64, 128])
-    valid_heads = [h for h in [2, 4, 8, 16, 24, 32] if cfg.d_model % h == 0]
-    cfg.n_heads = trial.suggest_categorical("n_heads", valid_heads)
+    model_head_pairs = [
+        (16, 2),
+        (16, 4),
+        (16, 8),
+        (16, 16),
+        (32, 2),
+        (32, 4),
+        (32, 8),
+        (32, 16),
+        (32, 32),
+        (64, 2),
+        (64, 4),
+        (64, 8),
+        (64, 16),
+        (64, 32),
+        (128, 2),
+        (128, 4),
+        (128, 8),
+        (128, 16),
+        (128, 32),
+    ]
+    cfg.d_model, cfg.n_heads = trial.suggest_categorical("model_heads", model_head_pairs)
     cfg.e_layers = trial.suggest_categorical("e_layers", [1, 2, 3, 4])
     cfg.d_layers = trial.suggest_categorical(
         "d_layers", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
