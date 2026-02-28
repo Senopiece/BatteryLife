@@ -16,7 +16,7 @@ if ROOT_DIR not in sys.path:
 import numpy as np
 import optuna
 import torch
-from sklearn.metrics import mean_absolute_percentage_error, root_mean_squared_error
+from sklearn.metrics import root_mean_squared_error
 from torch import nn, optim
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
@@ -26,14 +26,10 @@ from models import CPTransformer
 from utils import trackio_logging
 from utils.tools import get_parameter_number
 
-ACC_THRESHOLDS = (0.10, 0.15)
-
-
 @dataclass
 class CachedData:
     train_dataset: Dataset_original
     val_dataset: Dataset_original
-    test_dataset: Dataset_original
 
 
 def set_seed(seed: int) -> None:
@@ -119,37 +115,20 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.wd = trial.suggest_float("wd", 0.0, 1e-3)
     cfg.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
     model_head_pairs = [
-        [16, 2],
-        [16, 4],
-        [16, 8],
-        [16, 16],
-        [32, 2],
-        [32, 4],
-        [32, 8],
-        [32, 16],
-        [32, 32],
-        [64, 2],
-        [64, 4],
-        [64, 8],
-        [64, 16],
-        [64, 32],
-        [128, 2],
-        [128, 4],
-        [128, 8],
-        [128, 16],
-        [128, 32],
+        [d, h]
+        for d in [16, 32, 64, 128]
+        for h in [2, 4, 8, 16, 32]
+        if h <= d
     ]
     cfg.d_model, cfg.n_heads = trial.suggest_categorical("model_heads", model_head_pairs)
-    cfg.e_layers = trial.suggest_categorical("e_layers", [1, 2, 3, 4])
-    cfg.d_layers = trial.suggest_categorical(
-        "d_layers", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    )
+    cfg.e_layers = trial.suggest_int("e_layers", 1, 16)
+    cfg.d_layers = trial.suggest_int("d_layers", 1, 16)
     cfg.d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256])
     cfg.dropout = trial.suggest_float("dropout", 0.0, 0.3)
     cfg.lradj = trial.suggest_categorical("lradj", ["constant", "COS", "onecycle"])
     cfg.pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
     cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8])
-    cfg.factor = trial.suggest_categorical("factor", [1, 2, 3, 5])
+    cfg.factor = trial.suggest_int("factor", 1, 5)
     cfg.model_comment = f"trial-{trial.number}"
     return cfg
 
@@ -171,15 +150,9 @@ def load_data(args: SimpleNamespace) -> CachedData:
         args=args, flag="val", label_scaler=label_scaler, life_class_scaler=life_class_scaler
     )
     describe_dataset(val_dataset, "val")
-    print("[data] Loading test split...")
-    test_dataset = Dataset_original(
-        args=args, flag="test", label_scaler=label_scaler, life_class_scaler=life_class_scaler
-    )
-    describe_dataset(test_dataset, "test")
     return CachedData(
         train_dataset=train_dataset,
         val_dataset=val_dataset,
-        test_dataset=test_dataset,
     )
 
 
@@ -220,8 +193,7 @@ def evaluate_loader(
     dataset: Dataset_original,
     loader: DataLoader,
     device: torch.device,
-    alpha1: float,
-) -> tuple[float, float, float, float]:
+) -> float:
     preds = []
     refs = []
     std = np.sqrt(dataset.label_scaler.var_[-1])
@@ -239,21 +211,7 @@ def evaluate_loader(
             refs.extend(transformed_labels.detach().cpu().numpy().reshape(-1).tolist())
     model.train()
     rmse = root_mean_squared_error(refs, preds)
-    mape = mean_absolute_percentage_error(refs, preds)
-    acc10, acc15 = accuracy_at_pct(refs, preds)
-    return rmse, mape, acc10, acc15
-
-
-def accuracy_at_pct(refs: list[float], preds: list[float]) -> tuple[float, float]:
-    if not refs:
-        return 0.0, 0.0
-    refs_arr = np.asarray(refs, dtype=np.float64)
-    preds_arr = np.asarray(preds, dtype=np.float64)
-    denom = np.maximum(np.abs(refs_arr), 1e-8)
-    ape = np.abs(preds_arr - refs_arr) / denom
-    acc10 = float(np.mean(ape <= ACC_THRESHOLDS[0]))
-    acc15 = float(np.mean(ape <= ACC_THRESHOLDS[1]))
-    return acc10, acc15
+    return rmse
 
 
 def train_one_trial(
@@ -281,15 +239,6 @@ def train_one_trial(
         train=False,
         seed=args.seed,
     )
-    test_loader = make_loader(
-        cached.test_dataset,
-        args.batch_size,
-        args.num_workers,
-        args.dataloader_timeout,
-        train=False,
-        seed=args.seed,
-    )
-
     model = CPTransformer.Model(args).float().to(device)
     para_res = get_parameter_number(model)
     model_size = int(para_res["Total"])
@@ -330,12 +279,11 @@ def train_one_trial(
     print(
         f"[trial {trial.number}] "
         f"train_samples={len(cached.train_dataset)} val_samples={len(cached.val_dataset)} "
-        f"test_samples={len(cached.test_dataset)} steps_per_epoch={len(train_loader)}"
+        f"steps_per_epoch={len(train_loader)}"
     )
 
     trackio_logging.init(project=trackio_project, config=run_config, name=run_name)
-    best_val_mape = float("inf")
-    best_test_mape = float("inf")
+    best_val_rmse = float("inf")
     best_time_sec = 0.0
     epochs_since_improve = 0
     try:
@@ -381,18 +329,10 @@ def train_one_trial(
             if args.lradj == "COS" and scheduler is not None:
                 scheduler.step()
 
-            train_mape = mean_absolute_percentage_error(total_refs, total_preds)
-            train_acc10, train_acc15 = accuracy_at_pct(total_refs, total_preds)
             train_loss = total_loss / max(len(train_loader), 1)
-            val_rmse, val_mape, val_acc10, val_acc15 = evaluate_loader(
-                model, cached.val_dataset, val_loader, device, args.alpha1
-            )
-            test_rmse, test_mape, test_acc10, test_acc15 = evaluate_loader(
-                model, cached.test_dataset, test_loader, device, args.alpha1
-            )
-            if val_mape < best_val_mape:
-                best_val_mape = val_mape
-                best_test_mape = test_mape
+            val_rmse = evaluate_loader(model, cached.val_dataset, val_loader, device)
+            if val_rmse < best_val_rmse:
+                best_val_rmse = val_rmse
                 best_time_sec = time.time() - trial_start
                 epochs_since_improve = 0
             else:
@@ -400,36 +340,22 @@ def train_one_trial(
 
             print(
                 f"[trial {trial.number}] epoch={epoch + 1}/{args.train_epochs} "
-                f"train_loss={train_loss:.6f} train_mape={train_mape:.6f} "
-                f"train_acc10={train_acc10:.4f} train_acc15={train_acc15:.4f} "
-                f"val_rmse={val_rmse:.6f} val_mape={val_mape:.6f} "
-                f"val_acc10={val_acc10:.4f} val_acc15={val_acc15:.4f} "
-                f"test_rmse={test_rmse:.6f} test_mape={test_mape:.6f} "
-                f"test_acc10={test_acc10:.4f} test_acc15={test_acc15:.4f}"
+                f"train_loss={train_loss:.6f} "
+                f"val_rmse={val_rmse:.6f}"
             )
 
             trackio_logging.log(
                 {
                     "epoch": epoch,
                     "train_loss": train_loss,
-                    "train_mape": train_mape,
-                    "train_acc10": train_acc10,
-                    "train_acc15": train_acc15,
-                    "vali_RMSE": val_rmse,
-                    "vali_MAPE": val_mape,
-                    "vali_acc10": val_acc10,
-                    "vali_acc15": val_acc15,
-                    "test_RMSE": test_rmse,
-                    "test_MAPE": test_mape,
-                    "test_acc10": test_acc10,
-                    "test_acc15": test_acc15,
+                    "val_rmse": val_rmse,
                 },
                 step=global_step,
             )
 
             if args.patience > 0 and epochs_since_improve >= args.patience:
                 print(
-                    f"[trial {trial.number}] early stop: no val_mape improvement for "
+                    f"[trial {trial.number}] early stop: no val_rmse improvement for "
                     f"{args.patience} epochs"
                 )
                 break
@@ -440,14 +366,13 @@ def train_one_trial(
         train_time_sec = time.time() - trial_start
         trackio_logging.log(
             {
-                "best_vali_MAPE": best_val_mape,
-                "best_test_MAPE": best_test_mape,
+                "best_val_rmse": best_val_rmse,
                 "train_time_sec": train_time_sec,
                 "best_time_sec": best_time_sec,
                 "model_total_params": model_size,
             }
         )
-        return best_val_mape, model_size, best_time_sec
+        return best_val_rmse, model_size, best_time_sec
     finally:
         trackio_logging.finish()
         del model
@@ -540,7 +465,7 @@ def main() -> int:
     print("Pareto-optimal trials:")
     for t in study.best_trials:
         print(
-            f"  trial={t.number} val_mape={t.values[0]:.6f} "
+            f"  trial={t.number} val_rmse={t.values[0]:.6f} "
             f"model_size={int(t.values[1])} train_time_sec={t.values[2]:.2f} params={t.params}"
         )
     return 0
