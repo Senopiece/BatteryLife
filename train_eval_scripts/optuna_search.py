@@ -475,6 +475,7 @@ def main() -> int:
     parser.add_argument("--charge-discharge-length", type=int, default=300)
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--cpu", action="store_true", default=False)
     args = parser.parse_args()
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
@@ -496,7 +497,7 @@ def main() -> int:
 
     project = args.trackio_project or args.study_name
     print(f'Trackio: trackio show --project "{project}"')
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     base_args = build_base_args(args)
     cached = load_data(base_args)
 
