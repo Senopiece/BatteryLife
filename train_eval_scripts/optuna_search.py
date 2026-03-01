@@ -83,6 +83,7 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
         pct_start=0.2,
         accumulation_steps=1,
         factor=1,
+        agf_order=args.agf_order,
     )
 
 
@@ -129,6 +130,9 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
     cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8])
     cfg.factor = trial.suggest_int("factor", 1, 5)
+    cfg.agf_alphas_act = trial.suggest_categorical(
+        "agf_alphas_act", ["gelu", "relu", "tanh", "sigmoid", "identity", "softmax"]
+    )
     cfg.model_comment = f"trial-{trial.number}"
     return cfg
 
@@ -274,6 +278,7 @@ def train_one_trial(
         f"batch_size={args.batch_size} lr={args.learning_rate:.3e} wd={args.wd:.3e} "
         f"d_model={args.d_model} n_heads={args.n_heads} e_layers={args.e_layers} d_layers={args.d_layers} "
         f"d_ff={args.d_ff} dropout={args.dropout} lradj={args.lradj} "
+        f"agf_alphas_act={args.agf_alphas_act} "
         f"accumulation_steps={args.accumulation_steps}"
     )
     print(
@@ -384,8 +389,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="In-process Optuna search for CPTransformer on NAion")
     parser.add_argument("--trials", type=int, default=100)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--storage", type=str, default="sqlite:///optuna_cptransformer_naion.db")
-    parser.add_argument("--study-name", type=str, default="cptransformer_naion")
+    parser.add_argument("--study-name", type=str, default="cptransformer_naion2")
     parser.add_argument("--data", type=str, default="Dataset_original")
     parser.add_argument("--root-path", type=str, default="./dataset")
     parser.add_argument("--trackio-project", type=str, default="")
@@ -401,16 +405,29 @@ def main() -> int:
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
     parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--cpu", action="store_true", default=False)
+    parser.add_argument("--agf-order", type=int, default=1)
     args = parser.parse_args()
+
+    if args.agf_order < 1:
+        raise ValueError("--agf-order must be >= 1")
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
     set_seed(seed)
 
+    suffix = f"-o{args.agf_order}" if args.agf_order > 1 else ""
+    def append_suffix_once(value: str, sfx: str) -> str:
+        if not sfx:
+            return value
+        return value if value.endswith(sfx) else f"{value}{sfx}"
+
+    study_name = append_suffix_once(args.study_name, suffix)
+    storage = f"sqlite:///{study_name}.db"
+
     sampler = optuna.samplers.TPESampler(seed=seed)
     try:
         study = optuna.create_study(
-            study_name=args.study_name,
-            storage=args.storage,
+            study_name=study_name,
+            storage=storage,
             load_if_exists=True,
             sampler=sampler,
             directions=["minimize", "minimize", "minimize"],
@@ -420,7 +437,9 @@ def main() -> int:
             f"{exc}\nUse a new --study-name for this objective setup or a new --storage database."
         ) from exc
 
-    project = args.trackio_project or args.study_name
+    project_base = args.trackio_project or args.study_name
+    project = append_suffix_once(project_base, suffix)
+    print(f"[meta] agf_order={args.agf_order} study_name={study_name} storage={storage}")
     print(f'Trackio: trackio show --project "{project}"')
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     base_args = build_base_args(args)

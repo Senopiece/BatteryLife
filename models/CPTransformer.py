@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer, ConvLayer
-from layers.SelfAttention_Family import FullAttention, AttentionLayer
+from layers.AGFAttention import AGFAttentionLayer
 from layers.Embed import DataEmbedding, PositionalEmbedding
 class MLPBlock(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, drop_rate):
@@ -42,9 +42,15 @@ class Model(nn.Module):
         self.inter_TransformerEncoder = Encoder(
             [
                 EncoderLayer(
-                    AttentionLayer(
-                        FullAttention(True, configs.factor, attention_dropout=configs.dropout,
-                                      output_attention=False), configs.d_model, configs.n_heads),
+                    AGFAttentionLayer(
+                        d_model=configs.d_model,
+                        n_heads=configs.n_heads,
+                        order=getattr(configs, "agf_order", 3),
+                        top_k=getattr(configs, "agf_top_k", None),
+                        basis=getattr(configs, "agf_basis", "monomial"),
+                        alphas_act=getattr(configs, "agf_alphas_act", "gelu"),
+                        output_attention=False,
+                    ),
                     configs.d_model,
                     configs.d_ff,
                     dropout=configs.dropout,
