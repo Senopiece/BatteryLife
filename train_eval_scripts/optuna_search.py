@@ -293,7 +293,7 @@ def train_one_trial(
     best_val_rmse = float("inf")
     best_smoothed_rmse = float("inf")
     val_rmse_hist: list[float] = []
-    smooth_k = 3
+    smooth_k = 5
     epochs_since_improve = 0
     try:
         global_step = 0
