@@ -13,3 +13,4 @@ dataset/processed
 cptransformer_naion*
 optuna_cptransformer_naion*
 checkpoints
+runs.json

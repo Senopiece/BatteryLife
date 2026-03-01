@@ -2,24 +2,22 @@ model_name=CPTransformer
 dataset=NAion
 train_epochs=100
 early_cycle_threshold=100
-learning_rate=0.00005
+learning_rate=0.00001
 master_port=25215
-num_process=1
-batch_size=16
-n_heads=4
-seq_len=1
-accumulation_steps=2
-lstm_layers=6
-e_layers=12
-d_layers=0
-d_model=128
-d_ff=256
-dropout=0
+num_process=0
+batch_size=64
+n_heads=2
+seq_len=10
+accumulation_steps=4
+e_layers=7
+d_layers=4 # todo: try d=4, o=1 vs d=1, o=4
+d_model=32
+d_ff=64
+dropout=0.09481290915677548
 charge_discharge_length=300
-patience=50 # Eearly stopping patience
-lradj=constant
+patience=15 # Eearly stopping patience
+lradj=COS
 loss=MSE
-seed=2021
 
 checkpoints=/out/checkpoints/cpt # the save path of checkpoints
 data=Dataset_original
@@ -39,7 +37,6 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes $num_process --main_p
   --label_len 50 \
   --factor 3 \
   --enc_in 3 \
-  --seed $seed \
   --dec_in 1 \
   --c_out 1 \
   --des 'Exp' \
@@ -55,7 +52,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes $num_process --main_p
   --dataset $dataset \
   --num_workers 1 \
   --e_layers $e_layers \
-  --lstm_layers $lstm_layers \
+  --lstm_layers 6 \
   --d_layers $d_layers \
   --patience $patience \
   --n_heads $n_heads \
@@ -63,5 +60,6 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes $num_process --main_p
   --dropout $dropout \
   --lradj $lradj \
   --loss $loss \
-  --checkpoints $checkpoints 
+  --checkpoints $checkpoints \
+  --wd 0.0006710947780627601
 

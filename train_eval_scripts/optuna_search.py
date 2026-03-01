@@ -112,24 +112,26 @@ def describe_dataset(ds: Dataset_original, name: str) -> None:
 def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> SimpleNamespace:
     cfg = SimpleNamespace(**vars(base))
     cfg.seed = seed
-    cfg.learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-3, log=True)
-    cfg.wd = trial.suggest_float("wd", 0.0, 1e-3)
-    cfg.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    cfg.learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-3, log=True) # recommend smaller
+    cfg.wd = trial.suggest_float("wd", 0.0, 1e-3) # nontrivial, but ok is 0.0002, 0.0003, 0.00065
+    cfg.batch_size = trial.suggest_categorical("batch_size", [16, 32, 64]) # 32, 64 are ok
     model_head_pairs = [
         [d, h]
-        for d in [16, 32, 64, 128]
-        for h in [2, 4, 8, 16, 32]
+        for d in [16, 32, 64, 128] # recommend 128
+        for h in [2, 4, 8, 16, 32] # recommend 8. 2-4 and 16 ok
         if h <= d
     ]
     cfg.d_model, cfg.n_heads = trial.suggest_categorical("model_heads", model_head_pairs)
-    cfg.e_layers = trial.suggest_int("e_layers", 1, 16)
-    cfg.d_layers = trial.suggest_int("d_layers", 1, 16)
-    cfg.d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256])
-    cfg.dropout = trial.suggest_float("dropout", 0.0, 0.3)
-    cfg.lradj = trial.suggest_categorical("lradj", ["constant", "COS", "onecycle"])
+    cfg.e_layers = trial.suggest_int("e_layers", 1, 16) # recommend 2, 12 ok, then 4-6
+    cfg.d_layers = trial.suggest_int("d_layers", 1, 16) # recommend 14,6,4. 2,8,12 ok
+    cfg.d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256]) # recommend 64, can be more, but a little no difference
+    cfg.dropout = trial.suggest_float("dropout", 0.0, 0.3) # recommend moderate/low: 0.03–0.22
+    cfg.lradj = trial.suggest_categorical("lradj", ["constant", "COS", "onecycle"]) # recommended cos
     cfg.pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
-    cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8])
+    cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8]) # recommend 4
     cfg.factor = trial.suggest_int("factor", 1, 5)
+    if cfg.agf_order is None:
+        cfg.agf_order = trial.suggest_int("agf_order", 1, 5)
     cfg.agf_alphas_act = trial.suggest_categorical(
         "agf_alphas_act", ["gelu", "relu", "tanh", "sigmoid", "identity", "softmax"]
     )
@@ -280,6 +282,7 @@ def train_one_trial(
         f"batch_size={args.batch_size} lr={args.learning_rate:.3e} wd={args.wd:.3e} "
         f"d_model={args.d_model} n_heads={args.n_heads} e_layers={args.e_layers} d_layers={args.d_layers} "
         f"d_ff={args.d_ff} dropout={args.dropout} lradj={args.lradj} "
+        f"agf_order={args.agf_order} "
         f"agf_alphas_act={args.agf_alphas_act} "
         f"accumulation_steps={args.accumulation_steps}"
     )
@@ -424,16 +427,32 @@ def main() -> int:
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--cpu", action="store_true", default=False)
-    parser.add_argument("--agf-order", type=int, default=1)
+    parser.add_argument(
+        "--agf-order",
+        type=str,
+        default="1",
+        help='Fixed AGF order (e.g. 1,2,3). Use "None" to search agf_order in [1,5].',
+    )
     args = parser.parse_args()
 
-    if args.agf_order < 1:
-        raise ValueError("--agf-order must be >= 1")
+    agf_order_raw = args.agf_order.strip()
+    if agf_order_raw.lower() == "none":
+        args.agf_order = None
+    else:
+        try:
+            args.agf_order = int(agf_order_raw)
+        except ValueError as exc:
+            raise ValueError('--agf-order must be an integer or "None"') from exc
+        if args.agf_order < 1:
+            raise ValueError("--agf-order must be >= 1")
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
     set_seed(seed)
 
-    suffix = f"-o{args.agf_order}" if args.agf_order > 1 else ""
+    if args.agf_order is None:
+        suffix = "-o"
+    else:
+        suffix = f"-o{args.agf_order}" if args.agf_order > 1 else ""
     def append_suffix_once(value: str, sfx: str) -> str:
         if not sfx:
             return value
