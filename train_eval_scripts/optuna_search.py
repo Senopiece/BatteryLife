@@ -225,7 +225,7 @@ def train_one_trial(
     device: torch.device,
     trackio_project: str,
     trial_timeout_sec: int,
-) -> tuple[float, int, float]:
+) -> tuple[float, float, int]:
     trial_start = time.time()
     train_loader = make_loader(
         cached.train_dataset,
@@ -271,6 +271,8 @@ def train_one_trial(
     run_config["model_total_params"] = para_res["Total"]
     run_config["model_trainable_params"] = para_res["Trainable"]
     run_config["model_trainable_percent"] = para_res["Percent"]
+    run_config["val_smoothing"] = "gaussian_last_k"
+    run_config["val_smoothing_k"] = 3
 
     print(
         f"[trial {trial.number}] "
@@ -289,7 +291,9 @@ def train_one_trial(
 
     trackio_logging.init(project=trackio_project, config=run_config, name=run_name)
     best_val_rmse = float("inf")
-    best_time_sec = 0.0
+    best_smoothed_rmse = float("inf")
+    val_rmse_hist: list[float] = []
+    smooth_k = 3
     epochs_since_improve = 0
     try:
         global_step = 0
@@ -336,17 +340,29 @@ def train_one_trial(
 
             train_loss = total_loss / max(len(train_loader), 1)
             val_rmse = evaluate_loader(model, cached.val_dataset, val_loader, device)
+            val_rmse_hist.append(val_rmse)
+            tail = np.array(val_rmse_hist[-smooth_k:], dtype=np.float64)
+            # Gaussian weights over the available last-k epochs (newest gets highest weight).
+            sigma = max(smooth_k / 2.0, 1.0)
+            idx = np.arange(len(tail), dtype=np.float64)
+            center = len(tail) - 1
+            weights = np.exp(-0.5 * ((idx - center) / sigma) ** 2)
+            weights = weights / weights.sum()
+            val_smoothed_rmse = float(np.sum(weights * tail))
+
             if val_rmse < best_val_rmse:
                 best_val_rmse = val_rmse
-                best_time_sec = time.time() - trial_start
                 epochs_since_improve = 0
             else:
                 epochs_since_improve += 1
+            if val_smoothed_rmse < best_smoothed_rmse:
+                best_smoothed_rmse = val_smoothed_rmse
 
             print(
                 f"[trial {trial.number}] epoch={epoch + 1}/{args.train_epochs} "
                 f"train_loss={train_loss:.6f} "
-                f"val_rmse={val_rmse:.6f}"
+                f"val_rmse={val_rmse:.6f} "
+                f"val_smoothed_rmse={val_smoothed_rmse:.6f}"
             )
 
             trackio_logging.log(
@@ -354,6 +370,7 @@ def train_one_trial(
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "val_rmse": val_rmse,
+                    "val_smoothed_rmse": val_smoothed_rmse,
                 },
                 step=global_step,
             )
@@ -369,15 +386,17 @@ def train_one_trial(
                 raise RuntimeError(f"trial timed out after {trial_timeout_sec}s")
 
         train_time_sec = time.time() - trial_start
+        scalar_objective = 3000000.0 * best_smoothed_rmse + model_size
         trackio_logging.log(
             {
                 "best_val_rmse": best_val_rmse,
+                "best_smoothed_rmse": best_smoothed_rmse,
+                "objective_scalar": scalar_objective,
                 "train_time_sec": train_time_sec,
-                "best_time_sec": best_time_sec,
                 "model_total_params": model_size,
             }
         )
-        return best_val_rmse, model_size, best_time_sec
+        return scalar_objective, best_smoothed_rmse, model_size
     finally:
         trackio_logging.finish()
         del model
@@ -430,7 +449,7 @@ def main() -> int:
             storage=storage,
             load_if_exists=True,
             sampler=sampler,
-            directions=["minimize", "minimize", "minimize"],
+            direction="minimize",
         )
     except ValueError as exc:
         raise ValueError(
@@ -445,7 +464,7 @@ def main() -> int:
     base_args = build_base_args(args)
     cached = load_data(base_args)
 
-    def objective(trial: optuna.Trial) -> tuple[float, int, float]:
+    def objective(trial: optuna.Trial) -> float:
         trial_seed = seed + trial.number * 9973
         set_seed(trial_seed)
         trial_args = build_trial_args(base_args, trial, seed=trial_seed)
@@ -454,7 +473,7 @@ def main() -> int:
             trial.set_user_attr("failed", msg)
             raise optuna.TrialPruned(msg)
         try:
-            values = train_one_trial(
+            objective_scalar, best_smoothed_rmse, model_size = train_one_trial(
                 trial=trial,
                 args=trial_args,
                 cached=cached,
@@ -470,10 +489,10 @@ def main() -> int:
             print(f"[trial {trial.number}] {msg}")
             print(f"[trial {trial.number}] traceback:\n{traceback.format_exc()}")
             raise optuna.TrialPruned(msg) from exc
-        trial.set_user_attr("model_size", values[1])
-        trial.set_user_attr("train_time_sec", values[2])
+        trial.set_user_attr("model_size", model_size)
+        trial.set_user_attr("best_smoothed_rmse", best_smoothed_rmse)
         trial.set_user_attr("trial_seed", trial_seed)
-        return values
+        return objective_scalar
 
     try:
         study.optimize(objective, n_trials=args.trials, show_progress_bar=True, catch=())
@@ -481,12 +500,13 @@ def main() -> int:
         print("\nInterrupted by user. Progress is saved in Optuna storage; rerun the same command to resume.")
         return 130
 
-    print("Pareto-optimal trials:")
-    for t in study.best_trials:
-        print(
-            f"  trial={t.number} val_rmse={t.values[0]:.6f} "
-            f"model_size={int(t.values[1])} train_time_sec={t.values[2]:.2f} params={t.params}"
-        )
+    print("Best trial:")
+    best = study.best_trial
+    print(
+        f"  trial={best.number} objective={best.value:.6f} "
+        f"best_smoothed_rmse={best.user_attrs.get('best_smoothed_rmse')} "
+        f"model_size={best.user_attrs.get('model_size')} params={best.params}"
+    )
     return 0
 
 

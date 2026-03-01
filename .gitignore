@@ -10,5 +10,6 @@ dataset/NA-ion
 dataset/Life\ labels
 dataset/processed
 .venv/
+cptransformer_naion*
 optuna_cptransformer_naion*
 checkpoints
