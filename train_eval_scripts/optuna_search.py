@@ -386,7 +386,7 @@ def train_one_trial(
                 raise RuntimeError(f"trial timed out after {trial_timeout_sec}s")
 
         train_time_sec = time.time() - trial_start
-        scalar_objective = 3000000.0 * best_smoothed_rmse + model_size
+        scalar_objective = 10_000_000.0 * best_smoothed_rmse + model_size
         trackio_logging.log(
             {
                 "best_val_rmse": best_val_rmse,
@@ -418,11 +418,11 @@ def main() -> int:
     parser.add_argument("--early-cycle-threshold", type=int, default=100)
     parser.add_argument("--weighted_loss", action="store_true", default=False)
     parser.add_argument("--weighted_sampling", action="store_true", default=False)
-    parser.add_argument("--train-epochs", type=int, default=100)
+    parser.add_argument("--train-epochs", type=int, default=30)
     parser.add_argument("--seq-len", type=int, default=10)
     parser.add_argument("--charge-discharge-length", type=int, default=300)
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
-    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument("--agf-order", type=int, default=1)
     args = parser.parse_args()
