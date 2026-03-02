@@ -273,8 +273,6 @@ def train_one_trial(
     run_config["model_total_params"] = para_res["Total"]
     run_config["model_trainable_params"] = para_res["Trainable"]
     run_config["model_trainable_percent"] = para_res["Percent"]
-    run_config["val_smoothing"] = "gaussian_last_k"
-    run_config["val_smoothing_k"] = 3
 
     print(
         f"[trial {trial.number}] "
