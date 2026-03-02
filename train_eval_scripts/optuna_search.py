@@ -131,7 +131,7 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8]) # recommend 4
     cfg.factor = trial.suggest_int("factor", 1, 5)
     if cfg.agf_order is None:
-        cfg.agf_order = trial.suggest_int("agf_order", 1, 5)
+        cfg.agf_order = trial.suggest_int("agf_order", 1, 17)
     cfg.agf_alphas_act = trial.suggest_categorical(
         "agf_alphas_act", ["gelu", "relu", "tanh", "sigmoid", "identity", "softmax"]
     )
@@ -429,7 +429,7 @@ def main() -> int:
         "--agf-order",
         type=str,
         default="1",
-        help='Fixed AGF order (e.g. 1,2,3). Use "None" to search agf_order in [1,5].',
+        help='Fixed AGF order (e.g. 1,2,3). Use "None" to search agf_order in [1,17].',
     )
     args = parser.parse_args()
 
@@ -448,7 +448,7 @@ def main() -> int:
     set_seed(seed)
 
     if args.agf_order is None:
-        suffix = "-o"
+        suffix = "-o1-17"
     else:
         suffix = f"-o{args.agf_order}" if args.agf_order > 1 else ""
     def append_suffix_once(value: str, sfx: str) -> str:
