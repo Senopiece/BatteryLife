@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,7 +20,7 @@ import torch
 from sklearn.metrics import root_mean_squared_error
 from torch import nn, optim
 from torch.optim import lr_scheduler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from data_provider.data_loader import Dataset_original, my_collate_fn_baseline
 from models import CPTransformer
@@ -57,6 +58,7 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
         charge_discharge_length=args.charge_discharge_length,
         train_epochs=args.train_epochs,
         patience=args.patience,
+        percent=args.percent,
         # model/data defaults
         early_cycle_threshold=args.early_cycle_threshold,
         output_num=1,
@@ -84,6 +86,8 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
         accumulation_steps=1,
         factor=1,
         agf_order=args.agf_order,
+        agf_order_min=args.agf_order_min,
+        agf_order_max=args.agf_order_max,
     )
 
 
@@ -131,7 +135,7 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8]) # recommend 4
     cfg.factor = trial.suggest_int("factor", 1, 5)
     if cfg.agf_order is None:
-        cfg.agf_order = trial.suggest_int("agf_order", 1, 17)
+        cfg.agf_order = trial.suggest_int("agf_order", cfg.agf_order_min, cfg.agf_order_max)
     cfg.agf_alphas_act = trial.suggest_categorical(
         "agf_alphas_act", ["gelu", "relu", "tanh", "sigmoid", "identity", "softmax"]
     )
@@ -194,6 +198,38 @@ def make_loader(
     )
 
 
+def make_epoch_subsample_loader(
+    dataset: Dataset_original,
+    batch_size: int,
+    num_workers: int,
+    timeout: int,
+    seed: int,
+    epoch: int,
+    percent: int,
+) -> DataLoader:
+    dataset_size = len(dataset)
+    if dataset_size <= 0:
+        raise ValueError("train dataset is empty")
+    if not 1 <= percent <= 100:
+        raise ValueError(f"--percent must be in [1, 100], got {percent}")
+
+    sample_count = max(1, int(round(dataset_size * (percent / 100.0))))
+    sample_count = min(sample_count, dataset_size)
+
+    generator = torch.Generator()
+    generator.manual_seed(seed + epoch)
+    selected = torch.randperm(dataset_size, generator=generator)[:sample_count].tolist()
+    subset = Subset(dataset, selected)
+    return make_loader(
+        subset,
+        batch_size,
+        num_workers,
+        timeout,
+        train=True,
+        seed=seed + epoch,
+    )
+
+
 def evaluate_loader(
     model: nn.Module,
     dataset: Dataset_original,
@@ -229,13 +265,14 @@ def train_one_trial(
     trial_timeout_sec: int,
 ) -> tuple[float, float, int]:
     trial_start = time.time()
-    train_loader = make_loader(
+    train_loader = make_epoch_subsample_loader(
         cached.train_dataset,
         args.batch_size,
         args.num_workers,
         args.dataloader_timeout,
-        train=True,
         seed=args.seed,
+        epoch=0,
+        percent=args.percent,
     )
     val_loader = make_loader(
         cached.val_dataset,
@@ -287,6 +324,7 @@ def train_one_trial(
     print(
         f"[trial {trial.number}] "
         f"train_samples={len(cached.train_dataset)} val_samples={len(cached.val_dataset)} "
+        f"train_percent={args.percent}% sampled_train_samples={len(train_loader.dataset)} "
         f"steps_per_epoch={len(train_loader)}"
     )
 
@@ -299,6 +337,15 @@ def train_one_trial(
     try:
         global_step = 0
         for epoch in range(args.train_epochs):
+            train_loader = make_epoch_subsample_loader(
+                cached.train_dataset,
+                args.batch_size,
+                args.num_workers,
+                args.dataloader_timeout,
+                seed=args.seed,
+                epoch=epoch,
+                percent=args.percent,
+            )
             model.train()
             total_loss = 0.0
             std = np.sqrt(cached.train_dataset.label_scaler.var_[-1])
@@ -361,6 +408,7 @@ def train_one_trial(
 
             print(
                 f"[trial {trial.number}] epoch={epoch + 1}/{args.train_epochs} "
+                f"sampled_train_samples={len(train_loader.dataset)} "
                 f"train_loss={train_loss:.6f} "
                 f"val_rmse={val_rmse:.6f} "
                 f"val_smoothed_rmse={val_smoothed_rmse:.6f}"
@@ -409,7 +457,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="In-process Optuna search for CPTransformer on NAion")
     parser.add_argument("--trials", type=int, default=100)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--study-name", type=str, default="cptransformer_naion2")
+    parser.add_argument("--study-name", type=str, default="cptransformer_naion3")
     parser.add_argument("--data", type=str, default="Dataset_original")
     parser.add_argument("--root-path", type=str, default="./dataset")
     parser.add_argument("--trackio-project", type=str, default="")
@@ -424,33 +472,50 @@ def main() -> int:
     parser.add_argument("--charge-discharge-length", type=int, default=300)
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
     parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument(
+        "--percent",
+        type=int,
+        default=40,
+        help="Percent of train dataset sampled each epoch without replacement (1-100).",
+    )
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument(
         "--agf-order",
         type=str,
-        default="1",
-        help='Fixed AGF order (e.g. 1,2,3). Use "None" to search agf_order in [1,17].',
+        default="o1",
+        help='AGF order mode: "oX" (fixed) or "oX-Y" (search range), e.g. o1, o2, o1-17.',
     )
     args = parser.parse_args()
+    if not 1 <= args.percent <= 100:
+        raise ValueError("--percent must be in [1, 100]")
 
     agf_order_raw = args.agf_order.strip()
-    if agf_order_raw.lower() == "none":
-        args.agf_order = None
+    match = re.fullmatch(r"o(\d+)(?:-(\d+))?", agf_order_raw.lower())
+    if match is None:
+        raise ValueError('--agf-order must match "oX" or "oX-Y" (e.g. o1, o2, o1-17)')
+    agf_start = int(match.group(1))
+    agf_end = match.group(2)
+    if agf_start < 1:
+        raise ValueError("--agf-order values must be >= 1")
+    if agf_end is None:
+        args.agf_order = agf_start
+        args.agf_order_min = agf_start
+        args.agf_order_max = agf_start
+        suffix = f"-o{args.agf_order}" if args.agf_order > 1 else ""
     else:
-        try:
-            args.agf_order = int(agf_order_raw)
-        except ValueError as exc:
-            raise ValueError('--agf-order must be an integer or "None"') from exc
-        if args.agf_order < 1:
-            raise ValueError("--agf-order must be >= 1")
+        agf_stop = int(agf_end)
+        if agf_stop < 1:
+            raise ValueError("--agf-order values must be >= 1")
+        if agf_start > agf_stop:
+            raise ValueError("--agf-order range must satisfy X <= Y in oX-Y")
+        args.agf_order = None
+        args.agf_order_min = agf_start
+        args.agf_order_max = agf_stop
+        suffix = f"-o{args.agf_order_min}-{args.agf_order_max}"
 
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
     set_seed(seed)
 
-    if args.agf_order is None:
-        suffix = "-o1-17"
-    else:
-        suffix = f"-o{args.agf_order}" if args.agf_order > 1 else ""
     def append_suffix_once(value: str, sfx: str) -> str:
         if not sfx:
             return value
@@ -475,7 +540,11 @@ def main() -> int:
 
     project_base = args.trackio_project or args.study_name
     project = append_suffix_once(project_base, suffix)
-    print(f"[meta] agf_order={args.agf_order} study_name={study_name} storage={storage}")
+    if args.agf_order is None:
+        agf_mode = f"search[{args.agf_order_min},{args.agf_order_max}]"
+    else:
+        agf_mode = f"fixed[{args.agf_order}]"
+    print(f"[meta] agf_order={agf_mode} study_name={study_name} storage={storage}")
     print(f'Trackio: trackio show --project "{project}"')
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     base_args = build_base_args(args)
