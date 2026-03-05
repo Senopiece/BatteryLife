@@ -475,7 +475,7 @@ def main() -> int:
     parser.add_argument(
         "--percent",
         type=int,
-        default=40,
+        default=70,
         help="Percent of train dataset sampled each epoch without replacement (1-100).",
     )
     parser.add_argument("--cpu", action="store_true", default=False)
