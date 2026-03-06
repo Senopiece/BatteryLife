@@ -13,3 +13,5 @@ cptransformer*
 optuna_cptransformer_naion*
 checkpoints
 runs.json
+trackio
+optuna
