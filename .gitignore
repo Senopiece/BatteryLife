@@ -6,11 +6,10 @@ __pycache__/
 wandb/
 outs/
 dev/
-dataset/NA-ion
-dataset/Life\ labels
-dataset/processed
+dataset/*
+!dataset/seen_unseen_labels
 .venv/
-cptransformer_naion*
+cptransformer*
 optuna_cptransformer_naion*
 checkpoints
 runs.json

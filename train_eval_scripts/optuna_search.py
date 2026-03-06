@@ -19,8 +19,7 @@ import optuna
 import torch
 from sklearn.metrics import root_mean_squared_error
 from torch import nn, optim
-from torch.optim import lr_scheduler
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 
 from data_provider.data_loader import Dataset_original, my_collate_fn_baseline
 from models import CPTransformer
@@ -29,8 +28,11 @@ from utils.tools import get_parameter_number
 
 @dataclass
 class CachedData:
+    mode: str
     train_dataset: Dataset_original
     val_dataset: Dataset_original
+    li_train_dataset: Dataset_original | None = None
+    na_train_dataset: Dataset_original | None = None
 
 
 def set_seed(seed: int) -> None:
@@ -52,13 +54,13 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
         root_path=args.root_path,
         num_workers=args.num_workers,
         dataloader_timeout=args.dataloader_timeout,
-        weighted_sampling=args.weighted_sampling,
-        weighted_loss=args.weighted_loss,
+        weighted_sampling=False,
+        weighted_loss=False,
         seq_len=args.seq_len,
         charge_discharge_length=args.charge_discharge_length,
         train_epochs=args.train_epochs,
         patience=args.patience,
-        percent=args.percent,
+        samples=args.samples,
         # model/data defaults
         early_cycle_threshold=args.early_cycle_threshold,
         output_num=1,
@@ -81,8 +83,7 @@ def build_base_args(args: argparse.Namespace) -> SimpleNamespace:
         d_layers=2,
         d_ff=128,
         dropout=0.1,
-        lradj="constant",
-        pct_start=0.2,
+        lradj="COS",
         accumulation_steps=1,
         factor=1,
         agf_order=args.agf_order,
@@ -130,8 +131,7 @@ def build_trial_args(base: SimpleNamespace, trial: optuna.Trial, seed: int) -> S
     cfg.d_layers = trial.suggest_int("d_layers", 1, 16) # recommend 14,6,4. 2,8,12 ok
     cfg.d_ff = trial.suggest_categorical("d_ff", [32, 64, 128, 256]) # recommend 64, can be more, but a little no difference
     cfg.dropout = trial.suggest_float("dropout", 0.0, 0.3) # recommend moderate/low: 0.03–0.22
-    cfg.lradj = trial.suggest_categorical("lradj", ["constant", "COS", "onecycle"]) # recommended cos
-    cfg.pct_start = trial.suggest_float("pct_start", 0.05, 0.3)
+    cfg.lradj = "COS"
     cfg.accumulation_steps = trial.suggest_categorical("accumulation_steps", [1, 2, 4, 8]) # recommend 4
     cfg.factor = trial.suggest_int("factor", 1, 5)
     if cfg.agf_order is None:
@@ -150,24 +150,65 @@ def load_data(args: SimpleNamespace) -> CachedData:
         f"seq_len={args.seq_len} early_cycle_threshold={args.early_cycle_threshold} "
         f"charge_discharge_length={args.charge_discharge_length}"
     )
-    print("[data] Loading train split...")
-    train_dataset = Dataset_original(args=args, flag="train", label_scaler=None)
-    describe_dataset(train_dataset, "train")
-    label_scaler = train_dataset.return_label_scaler()
-    life_class_scaler = train_dataset.return_life_class_scaler()
-    print("[data] Loading val split...")
-    val_dataset = Dataset_original(
-        args=args, flag="val", label_scaler=label_scaler, life_class_scaler=life_class_scaler
+
+    if args.dataset != "LiNa":
+        print("[data] Loading train split...")
+        train_dataset = Dataset_original(args=args, flag="train", label_scaler=None)
+        describe_dataset(train_dataset, "train")
+        label_scaler = train_dataset.return_label_scaler()
+        life_class_scaler = train_dataset.return_life_class_scaler()
+        print("[data] Loading val split...")
+        val_dataset = Dataset_original(
+            args=args, flag="val", label_scaler=label_scaler, life_class_scaler=life_class_scaler
+        )
+        describe_dataset(val_dataset, "val")
+        return CachedData(mode="single", train_dataset=train_dataset, val_dataset=val_dataset)
+
+    # LiNa blended mode:
+    # train samples are mixed each epoch from:
+    #   - Li pool: MIX_large train
+    #   - Na pool: NAion train
+    # validation is always NAion val.
+    mix_args = SimpleNamespace(**vars(args))
+    mix_args.dataset = "MIX_large"
+    na_args = SimpleNamespace(**vars(args))
+    na_args.dataset = "NAion"
+
+    print("[data] [LiNa] Loading NAion train split...")
+    na_train_dataset = Dataset_original(args=na_args, flag="train", label_scaler=None)
+    describe_dataset(na_train_dataset, "na_train(NAion)")
+    na_label_scaler = na_train_dataset.return_label_scaler()
+    na_life_class_scaler = na_train_dataset.return_life_class_scaler()
+
+    print("[data] [LiNa] Loading NAion val split...")
+    na_val_dataset = Dataset_original(
+        args=na_args,
+        flag="val",
+        label_scaler=na_label_scaler,
+        life_class_scaler=na_life_class_scaler,
     )
-    describe_dataset(val_dataset, "val")
+    describe_dataset(na_val_dataset, "na_val(NAion)")
+
+    print("[data] [LiNa] Loading MIX_large train split with NAion scaler...")
+    li_train_dataset = Dataset_original(
+        args=mix_args,
+        flag="train",
+        label_scaler=na_label_scaler,
+        life_class_scaler=na_life_class_scaler,
+    )
+    describe_dataset(li_train_dataset, "li_train(MIX_large)")
+
     return CachedData(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
+        mode="lina_blend",
+        train_dataset=na_train_dataset,
+        val_dataset=na_val_dataset,
+        li_train_dataset=li_train_dataset,
+        na_train_dataset=na_train_dataset,
     )
 
 
 def make_loader(
-    dataset: Dataset_original,
+    dataset: Dataset,
     batch_size: int,
     num_workers: int,
     timeout: int,
@@ -198,22 +239,22 @@ def make_loader(
     )
 
 
-def make_epoch_subsample_loader(
+def make_epoch_subsample_loader_by_samples(
     dataset: Dataset_original,
     batch_size: int,
     num_workers: int,
     timeout: int,
     seed: int,
     epoch: int,
-    percent: int,
+    samples: int,
 ) -> DataLoader:
     dataset_size = len(dataset)
     if dataset_size <= 0:
         raise ValueError("train dataset is empty")
-    if not 1 <= percent <= 100:
-        raise ValueError(f"--percent must be in [1, 100], got {percent}")
+    if samples <= 0:
+        raise ValueError(f"--samples must be > 0, got {samples}")
 
-    sample_count = max(1, int(round(dataset_size * (percent / 100.0))))
+    sample_count = max(1, int(samples))
     sample_count = min(sample_count, dataset_size)
 
     generator = torch.Generator()
@@ -228,6 +269,79 @@ def make_epoch_subsample_loader(
         train=True,
         seed=seed + epoch,
     )
+
+
+def li_probability_for_epoch(epoch_one_based: int) -> float:
+    if epoch_one_based <= 15:
+        return 1.0
+    if epoch_one_based <= 80:
+        # Linearly anneal from 1.0 (epoch 16) to 0.1 (epoch 80), inclusive.
+        progress = (epoch_one_based - 16) / (80 - 16)
+        return 1.0 + (0.1 - 1.0) * progress
+    return 0.0
+
+
+def make_epoch_lina_mixed_loader(
+    li_dataset: Dataset_original,
+    na_dataset: Dataset_original,
+    batch_size: int,
+    num_workers: int,
+    timeout: int,
+    seed: int,
+    epoch: int,
+    samples: int,
+    p_li: float,
+) -> tuple[DataLoader, int, int]:
+    li_size = len(li_dataset)
+    na_size = len(na_dataset)
+    if li_size <= 0 or na_size <= 0:
+        raise ValueError("Li/Na train dataset is empty")
+    if samples <= 0:
+        raise ValueError(f"--samples must be > 0, got {samples}")
+    if not 0.0 <= p_li <= 1.0:
+        raise ValueError(f"p_li must be in [0,1], got {p_li}")
+
+    target_total = int(samples)
+    li_count = int(round(target_total * p_li))
+    li_count = min(li_count, li_size)
+    na_count = target_total - li_count
+    na_count = min(na_count, na_size)
+
+    # Fill any gap due clipping while keeping without-replacement sampling.
+    deficit = target_total - (li_count + na_count)
+    if deficit > 0:
+        li_spare = li_size - li_count
+        na_spare = na_size - na_count
+        add_na = min(deficit, na_spare)
+        na_count += add_na
+        deficit -= add_na
+        if deficit > 0:
+            add_li = min(deficit, li_spare)
+            li_count += add_li
+            deficit -= add_li
+
+    if li_count + na_count <= 0:
+        raise ValueError("No samples selected for mixed loader")
+
+    g_li = torch.Generator()
+    g_na = torch.Generator()
+    g_li.manual_seed(seed + epoch * 2 + 1)
+    g_na.manual_seed(seed + epoch * 2 + 2)
+    li_idx = torch.randperm(li_size, generator=g_li)[:li_count].tolist()
+    na_idx = torch.randperm(na_size, generator=g_na)[:na_count].tolist()
+
+    li_subset = Subset(li_dataset, li_idx)
+    na_subset = Subset(na_dataset, na_idx)
+    mixed_dataset = ConcatDataset([li_subset, na_subset])
+    loader = make_loader(
+        mixed_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        timeout=timeout,
+        train=True,
+        seed=seed + epoch,
+    )
+    return loader, li_count, na_count
 
 
 def evaluate_loader(
@@ -265,15 +379,37 @@ def train_one_trial(
     trial_timeout_sec: int,
 ) -> tuple[float, float, int]:
     trial_start = time.time()
-    train_loader = make_epoch_subsample_loader(
-        cached.train_dataset,
-        args.batch_size,
-        args.num_workers,
-        args.dataloader_timeout,
-        seed=args.seed,
-        epoch=0,
-        percent=args.percent,
-    )
+    if cached.mode == "lina_blend":
+        if cached.li_train_dataset is None or cached.na_train_dataset is None:
+            raise ValueError("LiNa blended mode requires li_train_dataset and na_train_dataset")
+        preview_p_li = li_probability_for_epoch(1)
+        preview_train_loader, preview_li_count, preview_na_count = make_epoch_lina_mixed_loader(
+            cached.li_train_dataset,
+            cached.na_train_dataset,
+            args.batch_size,
+            args.num_workers,
+            args.dataloader_timeout,
+            seed=args.seed,
+            epoch=0,
+            samples=args.samples,
+            p_li=preview_p_li,
+        )
+        scaler_dataset = cached.na_train_dataset
+    else:
+        preview_train_loader = make_epoch_subsample_loader_by_samples(
+            cached.train_dataset,
+            args.batch_size,
+            args.num_workers,
+            args.dataloader_timeout,
+            seed=args.seed,
+            epoch=0,
+            samples=args.samples,
+        )
+        preview_li_count = 0
+        preview_na_count = len(preview_train_loader.dataset)
+        preview_p_li = 0.0
+        scaler_dataset = cached.train_dataset
+
     val_loader = make_loader(
         cached.val_dataset,
         args.batch_size,
@@ -289,20 +425,9 @@ def train_one_trial(
     model_optim = optim.Adam(
         [p for p in model.parameters() if p.requires_grad], lr=args.learning_rate, weight_decay=args.wd
     )
-    if args.lradj == "COS":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            model_optim, T_max=max(args.train_epochs, 1), eta_min=1e-8
-        )
-    elif args.lradj == "onecycle":
-        scheduler = lr_scheduler.OneCycleLR(
-            optimizer=model_optim,
-            steps_per_epoch=max(len(train_loader), 1),
-            pct_start=args.pct_start,
-            epochs=args.train_epochs,
-            max_lr=args.learning_rate,
-        )
-    else:
-        scheduler = None
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        model_optim, T_max=max(args.train_epochs, 1), eta_min=1e-8
+    )
 
     criterion = nn.MSELoss(reduction="none")
     run_name = f"{args.model_comment}_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -321,12 +446,25 @@ def train_one_trial(
         f"agf_alphas_act={args.agf_alphas_act} "
         f"accumulation_steps={args.accumulation_steps}"
     )
+    if cached.mode == "lina_blend":
+        print(
+            f"[trial {trial.number}] LiNa blend schedule: "
+            "p_li=1.0 for epochs 1-15, "
+            "linear 1.0->0.1 for epochs 16-80, "
+            "p_li=0.0 for epochs >=81"
+        )
     print(
         f"[trial {trial.number}] "
-        f"train_samples={len(cached.train_dataset)} val_samples={len(cached.val_dataset)} "
-        f"train_percent={args.percent}% sampled_train_samples={len(train_loader.dataset)} "
-        f"steps_per_epoch={len(train_loader)}"
+        f"train_pool_samples={len(cached.train_dataset)} "
+        f"val_samples={len(cached.val_dataset)} "
+        f"samples_per_epoch={args.samples} sampled_train_samples={len(preview_train_loader.dataset)} "
+        f"steps_per_epoch={len(preview_train_loader)}"
     )
+    if cached.mode == "lina_blend":
+        print(
+            f"[trial {trial.number}] preview epoch1: p_li={preview_p_li:.4f} "
+            f"li_count={preview_li_count} na_count={preview_na_count}"
+        )
 
     trackio_logging.init(project=trackio_project, config=run_config, name=run_name)
     best_val_rmse = float("inf")
@@ -337,21 +475,38 @@ def train_one_trial(
     try:
         global_step = 0
         for epoch in range(args.train_epochs):
-            train_loader = make_epoch_subsample_loader(
-                cached.train_dataset,
-                args.batch_size,
-                args.num_workers,
-                args.dataloader_timeout,
-                seed=args.seed,
-                epoch=epoch,
-                percent=args.percent,
-            )
+            epoch_one_based = epoch + 1
+            if cached.mode == "lina_blend":
+                p_li = li_probability_for_epoch(epoch_one_based)
+                train_loader, li_count, na_count = make_epoch_lina_mixed_loader(
+                    cached.li_train_dataset,
+                    cached.na_train_dataset,
+                    args.batch_size,
+                    args.num_workers,
+                    args.dataloader_timeout,
+                    seed=args.seed,
+                    epoch=epoch,
+                    samples=args.samples,
+                    p_li=p_li,
+                )
+            else:
+                p_li = 0.0
+                train_loader = make_epoch_subsample_loader_by_samples(
+                    cached.train_dataset,
+                    args.batch_size,
+                    args.num_workers,
+                    args.dataloader_timeout,
+                    seed=args.seed,
+                    epoch=epoch,
+                    samples=args.samples,
+                )
+                li_count = 0
+                na_count = len(train_loader.dataset)
+
             model.train()
             total_loss = 0.0
-            std = np.sqrt(cached.train_dataset.label_scaler.var_[-1])
-            mean_value = cached.train_dataset.label_scaler.mean_[-1]
-            total_preds = []
-            total_refs = []
+            std = np.sqrt(scaler_dataset.label_scaler.var_[-1])
+            mean_value = scaler_dataset.label_scaler.mean_[-1]
             model_optim.zero_grad(set_to_none=True)
             for i, (cycle_curve_data, curve_attn_mask, labels, life_class, scaled_life_class, weights, seen_unseen_ids) in enumerate(train_loader):
                 cycle_curve_data = cycle_curve_data.float().to(device)
@@ -367,24 +522,14 @@ def train_one_trial(
                 if (i + 1) % args.accumulation_steps == 0:
                     model_optim.step()
                     model_optim.zero_grad(set_to_none=True)
-                    if args.lradj == "onecycle" and scheduler is not None:
-                        scheduler.step()
                 total_loss += loss.detach().item() * args.accumulation_steps
-
-                transformed_preds = outputs * std + mean_value
-                transformed_labels = labels * std + mean_value
-                total_preds.extend(transformed_preds.detach().cpu().numpy().reshape(-1).tolist())
-                total_refs.extend(transformed_labels.detach().cpu().numpy().reshape(-1).tolist())
                 global_step += 1
 
             if len(train_loader) % args.accumulation_steps != 0:
                 model_optim.step()
                 model_optim.zero_grad(set_to_none=True)
-                if args.lradj == "onecycle" and scheduler is not None:
-                    scheduler.step()
 
-            if args.lradj == "COS" and scheduler is not None:
-                scheduler.step()
+            scheduler.step()
 
             train_loss = total_loss / max(len(train_loader), 1)
             val_rmse = evaluate_loader(model, cached.val_dataset, val_loader, device)
@@ -406,23 +551,44 @@ def train_one_trial(
             if val_smoothed_rmse < best_smoothed_rmse:
                 best_smoothed_rmse = val_smoothed_rmse
 
-            print(
-                f"[trial {trial.number}] epoch={epoch + 1}/{args.train_epochs} "
-                f"sampled_train_samples={len(train_loader.dataset)} "
-                f"train_loss={train_loss:.6f} "
-                f"val_rmse={val_rmse:.6f} "
-                f"val_smoothed_rmse={val_smoothed_rmse:.6f}"
-            )
-
-            trackio_logging.log(
-                {
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_rmse": val_rmse,
-                    "val_smoothed_rmse": val_smoothed_rmse,
-                },
-                step=global_step,
-            )
+            if cached.mode == "lina_blend":
+                print(
+                    f"[trial {trial.number}] epoch={epoch_one_based}/{args.train_epochs} "
+                    f"p_li={p_li:.4f} li_count={li_count} na_count={na_count} "
+                    f"sampled_train_samples={len(train_loader.dataset)} "
+                    f"train_loss={train_loss:.6f} "
+                    f"val_rmse={val_rmse:.6f} "
+                    f"val_smoothed_rmse={val_smoothed_rmse:.6f}"
+                )
+                trackio_logging.log(
+                    {
+                        "epoch": epoch,
+                        "p_li": p_li,
+                        "li_count": li_count,
+                        "na_count": na_count,
+                        "train_loss": train_loss,
+                        "val_rmse": val_rmse,
+                        "val_smoothed_rmse": val_smoothed_rmse,
+                    },
+                    step=global_step,
+                )
+            else:
+                print(
+                    f"[trial {trial.number}] epoch={epoch_one_based}/{args.train_epochs} "
+                    f"sampled_train_samples={len(train_loader.dataset)} "
+                    f"train_loss={train_loss:.6f} "
+                    f"val_rmse={val_rmse:.6f} "
+                    f"val_smoothed_rmse={val_smoothed_rmse:.6f}"
+                )
+                trackio_logging.log(
+                    {
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "val_rmse": val_rmse,
+                        "val_smoothed_rmse": val_smoothed_rmse,
+                    },
+                    step=global_step,
+                )
 
             if args.patience > 0 and epochs_since_improve >= args.patience:
                 print(
@@ -454,40 +620,38 @@ def train_one_trial(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="In-process Optuna search for CPTransformer on NAion")
+    parser = argparse.ArgumentParser(description="In-process Optuna search for CPTransformer")
     parser.add_argument("--trials", type=int, default=100)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--study-name", type=str, default="cptransformer_naion3")
+    parser.add_argument("--study-name", type=str, default="cptransformer_lina")
     parser.add_argument("--data", type=str, default="Dataset_original")
     parser.add_argument("--root-path", type=str, default="./dataset")
     parser.add_argument("--trackio-project", type=str, default="")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--dataloader-timeout", type=int, default=0)
-    parser.add_argument("--dataset", type=str, default="NAion")
+    parser.add_argument("--dataset", type=str, default="LiNa")
     parser.add_argument("--early-cycle-threshold", type=int, default=100)
-    parser.add_argument("--weighted_loss", action="store_true", default=False)
-    parser.add_argument("--weighted_sampling", action="store_true", default=False)
-    parser.add_argument("--train-epochs", type=int, default=30)
+    parser.add_argument("--train-epochs", type=int, default=100)
     parser.add_argument("--seq-len", type=int, default=10)
     parser.add_argument("--charge-discharge-length", type=int, default=300)
     parser.add_argument("--trial-timeout-sec", type=int, default=7200)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument(
-        "--percent",
+        "--samples",
         type=int,
-        default=70,
-        help="Percent of train dataset sampled each epoch without replacement (1-100).",
+        default=8192,
+        help="Number of training samples drawn without replacement per epoch.",
     )
     parser.add_argument("--cpu", action="store_true", default=False)
     parser.add_argument(
         "--agf-order",
         type=str,
-        default="o1",
+        default="o1-5",
         help='AGF order mode: "oX" (fixed) or "oX-Y" (search range), e.g. o1, o2, o1-17.',
     )
     args = parser.parse_args()
-    if not 1 <= args.percent <= 100:
-        raise ValueError("--percent must be in [1, 100]")
+    if args.samples <= 0:
+        raise ValueError("--samples must be > 0")
 
     agf_order_raw = args.agf_order.strip()
     match = re.fullmatch(r"o(\d+)(?:-(\d+))?", agf_order_raw.lower())
